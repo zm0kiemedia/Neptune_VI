@@ -66,6 +66,32 @@ struct Last {
     asked: u64,
     /// The frame a partly mapped texture was last read in.
     partial: Option<u64>,
+    /// Checks left in which the memory is hashed whether or not a write of
+    /// it was seen ([`Last::hashed`]).
+    unseen: u32,
+}
+
+impl Last {
+    /// How many checks a texture is hashed at after it changed unseen.
+    const UNSEEN: u32 = 64;
+
+    /// Takes the hash of the memory just read: whether it changed. One that
+    /// changed though no write was seen (`unwritten`: written through
+    /// another view of its pages, as a video's frames are) is hashed at each
+    /// of its next checks, not at every eighth frame: a ring of such
+    /// textures showed its old pictures in turn until then.
+    fn hashed(&mut self, hash: blake3::Hash, unwritten: bool) -> bool {
+        let changed = self.hash != Some(hash);
+        if unwritten {
+            self.unseen = if changed && self.hash.is_some() {
+                Self::UNSEEN
+            } else {
+                self.unseen.saturating_sub(1)
+            };
+        }
+        self.hash = Some(hash);
+        changed
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -649,15 +675,16 @@ impl Staging {
         // the hash, which is taken every eighth frame only, by the
         // texture's address, so the textures take turns.
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+        let mut unwritten = false;
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
             const HASH_EVERY: u64 = 8;
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
             let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
-            if unwritten && !turn {
+            if unwritten && !turn && last.unseen == 0 {
                 return 0;
             }
         }
@@ -718,10 +745,10 @@ impl Staging {
                 let hash = blake3::hash(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-                if last.hash == Some(hash) {
+                if !last.hashed(hash, unwritten) {
                     return size;
                 }
-                last.hash = Some(hash);
+                self.seen_late(last, unwritten);
                 self.detile(tiled);
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -734,10 +761,10 @@ impl Staging {
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
-        if last.hash == Some(hash) {
+        if !last.hashed(hash, unwritten) {
             return size;
         }
-        last.hash = Some(hash);
+        self.seen_late(last, unwritten);
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -770,6 +797,23 @@ impl Staging {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
             0
+        }
+    }
+
+    /// Diagnostics: the first textures that changed with no write seen.
+    fn seen_late(&self, last: &Last, unwritten: bool) {
+        if unwritten && last.unseen == Last::UNSEEN {
+            static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 8 || n.is_power_of_two() {
+                tracing::info!(
+                    n,
+                    memory = ?self.memory,
+                    desc = ?self.layout.desc,
+                    frame = crate::frame::current(),
+                    "a texture changed though no write to it was seen: hashed at each check for a while"
+                );
+            }
         }
     }
 
@@ -1056,6 +1100,37 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod unseen_tests {
+    use super::Last;
+
+    /// A texture that changes with no write seen is hashed at each check for
+    /// a while; one whose changes are seen, or that stays the same, is not.
+    #[test]
+    fn a_texture_that_changed_unseen_is_hashed_at_each_check() {
+        let hash = |n: u8| blake3::hash(&[n]);
+        let mut last = Last::default();
+        // The first contents are not a change nobody saw.
+        assert!(last.hashed(hash(1), true));
+        assert_eq!(last.unseen, 0);
+        // A change that was seen.
+        assert!(last.hashed(hash(2), false));
+        assert_eq!(last.unseen, 0);
+        // Unseen: hashed at the next checks, as often as it goes on.
+        assert!(last.hashed(hash(3), true));
+        assert_eq!(last.unseen, Last::UNSEEN);
+        assert!(!last.hashed(hash(3), true));
+        assert_eq!(last.unseen, Last::UNSEEN - 1);
+        assert!(last.hashed(hash(4), true));
+        assert_eq!(last.unseen, Last::UNSEEN);
+        // And no longer once it has been still.
+        for _ in 0..Last::UNSEEN {
+            assert!(!last.hashed(hash(4), true));
+        }
+        assert_eq!(last.unseen, 0);
+    }
 }
 
 #[cfg(test)]
