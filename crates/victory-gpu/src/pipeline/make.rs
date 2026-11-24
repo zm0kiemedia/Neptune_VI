@@ -16,7 +16,7 @@
 //! runs only once and whose pipeline takes longer is lost.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -253,15 +253,74 @@ impl Queue {
         Some(prev == NOT_QUEUED)
     }
 
-    fn pop(&mut self) -> Option<Arc<Pending>> {
-        let p = self.requested.pop_front().or_else(|| {
+    /// The next pipeline to make, and whether it is an "early" one. Requested ones come first;
+    /// an early one only where `early_ok` (not too many workers on early ones already) and
+    /// where it needs no translation (`ready`): an early pipeline of a shader the cache does
+    /// not hold would put the translator on every worker at the title's start, and is
+    /// left for its first use instead (`skipped` of them are counted, to be taken off the
+    /// waiting count).
+    fn pop(&mut self, early_ok: bool, ready: impl Fn(&Pending) -> bool) -> Popped {
+        if let Some(p) = self.requested.pop_front() {
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            return Popped {
+                made: Some((p, false)),
+                skipped: 0,
+            };
+        }
+        let mut skipped = 0;
+        while early_ok && let Some(p) = self.early.pop_front() {
             // An early entry can have been promoted and claimed already.
-            std::iter::from_fn(|| self.early.pop_front())
-                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
-        })?;
-        p.queue_state.store(MAKING, Ordering::Relaxed);
-        Some(p)
+            if p.queue_state.load(Ordering::Relaxed) != EARLY {
+                continue;
+            }
+            if !ready(&p) {
+                p.queue_state.store(NOT_QUEUED, Ordering::Relaxed);
+                skipped += 1;
+                continue;
+            }
+            p.queue_state.store(MAKING, Ordering::Relaxed);
+            return Popped {
+                made: Some((p, true)),
+                skipped,
+            };
+        }
+        Popped {
+            made: None,
+            skipped,
+        }
     }
+}
+
+/// What [`Queue::pop`] found.
+struct Popped {
+    made: Option<(Arc<Pending>, bool)>,
+    skipped: usize,
+}
+
+/// How many workers may make early pipelines at once, of `workers`: a quarter of them, at
+/// least one (`VICTORY_EARLY_WORKERS` sets it; 0 sets no limit). The library lists thousands
+/// of pipelines to start early, each needing its shader's translation and the driver's
+/// compile: on every worker at once they took the processor from the title's own threads
+/// while it loaded.
+fn early_cap_for(workers: usize, setting: Option<&str>) -> usize {
+    match setting.and_then(|v| v.trim().parse::<usize>().ok()) {
+        Some(0) => usize::MAX,
+        Some(n) => n,
+        None => workers.div_ceil(4).max(1),
+    }
+}
+
+/// Workers making an early pipeline now. Changed only under the queue's lock.
+static EARLY_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+/// The most workers on early pipelines at once ([`early_cap_for`]).
+static EARLY_CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Whether every shader of `p` is translated already or in the shader cache (a pipeline whose
+/// making costs no translation).
+fn translations_ready(p: &Pending) -> bool {
+    p.shaders
+        .iter()
+        .all(|s| s.translated.get().is_some() || crate::shader_cache::is_cached(&s.container))
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());
@@ -288,14 +347,31 @@ fn start(p: &Arc<Pending>, priority: u8) {
     }
 }
 
-fn next() -> Arc<Pending> {
+fn next() -> (Arc<Pending>, bool) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        if let Some(p) = queue.pop() {
-            return p;
+        let early_ok = EARLY_ACTIVE.load(Ordering::Relaxed) < EARLY_CAP.load(Ordering::Relaxed);
+        let found = queue.pop(early_ok, translations_ready);
+        if found.skipped > 0 {
+            WAITING.fetch_sub(found.skipped as u64, Ordering::Relaxed);
+        }
+        if let Some((p, early)) = found.made {
+            if early {
+                EARLY_ACTIVE.fetch_add(1, Ordering::Relaxed);
+            }
+            return (p, early);
         }
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
+}
+
+/// A worker is done with an early pipeline: another may take one. Under the queue's lock, so
+/// that a worker that found the limit reached is waiting when this wakes it.
+fn early_done() {
+    let queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    EARLY_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+    drop(queue);
+    AVAILABLE.notify_all();
 }
 
 /// Starts the workers (half the logical processors, 2 to 8) on first use.
@@ -304,6 +380,11 @@ fn workers() -> bool {
     *RUNNING.get_or_init(|| {
         let mut running = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
+        let cap = early_cap_for(
+            workers,
+            std::env::var("VICTORY_EARLY_WORKERS").ok().as_deref(),
+        );
+        EARLY_CAP.store(cap, Ordering::Relaxed);
         for i in 0..workers {
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
@@ -315,7 +396,11 @@ fn workers() -> bool {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        next().make();
+                        let (p, early) = next();
+                        p.make();
+                        if early {
+                            early_done();
+                        }
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
                         } else {
@@ -396,10 +481,65 @@ mod tests {
         assert_eq!(queue.push(&promoted, REQUESTED), Some(false));
         assert_eq!(queue.push(&promoted, REQUESTED), None);
 
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &requested));
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &promoted));
+        let first = |queue: &mut Queue| queue.pop(true, |_| true).made;
+        let (p, early) = first(&mut queue).unwrap();
+        assert!(Arc::ptr_eq(&p, &requested) && !early);
+        let (p, early) = first(&mut queue).unwrap();
+        assert!(Arc::ptr_eq(&p, &promoted) && !early);
         assert_eq!(queue.push(&promoted, REQUESTED), None);
-        assert!(Arc::ptr_eq(&queue.pop().unwrap(), &earlier));
-        assert!(queue.pop().is_none());
+        let (p, early) = first(&mut queue).unwrap();
+        assert!(Arc::ptr_eq(&p, &earlier) && early);
+        assert!(first(&mut queue).is_none());
+    }
+
+    #[test]
+    fn early_workers_are_a_quarter_of_them_and_one_at_least() {
+        assert_eq!(early_cap_for(8, None), 2);
+        assert_eq!(early_cap_for(4, None), 1);
+        assert_eq!(early_cap_for(5, None), 2);
+        assert_eq!(early_cap_for(2, None), 1);
+        assert_eq!(early_cap_for(1, None), 1);
+        // the setting wins; 0 is no limit; a word is no setting
+        assert_eq!(early_cap_for(8, Some("3")), 3);
+        assert_eq!(early_cap_for(8, Some("0")), usize::MAX);
+        assert_eq!(early_cap_for(8, Some("many")), 2);
+    }
+
+    #[test]
+    fn early_pipelines_wait_for_a_free_early_worker_and_requested_ones_do_not() {
+        let early = Arc::new(Pending::new(Vec::new(), None));
+        let requested = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        queue.push(&early, EARLY);
+        // the limit is reached: nothing early is taken, and it stays queued
+        assert!(queue.pop(false, |_| true).made.is_none());
+        assert_eq!(early.queue_state.load(Ordering::Relaxed), EARLY);
+        // a requested one goes past the limit, and past the early one before it
+        queue.push(&requested, REQUESTED);
+        let taken = queue.pop(false, |_| true).made.unwrap();
+        assert!(Arc::ptr_eq(&taken.0, &requested) && !taken.1);
+        // a worker is free again
+        let taken = queue.pop(true, |_| true).made.unwrap();
+        assert!(Arc::ptr_eq(&taken.0, &early) && taken.1);
+    }
+
+    #[test]
+    fn an_early_pipeline_that_needs_a_translation_is_left_for_its_first_use() {
+        let ready = Arc::new(Pending::new(Vec::new(), None));
+        let cold = Arc::new(Pending::new(Vec::new(), None));
+        let mut queue = Queue::new();
+        queue.push(&cold, EARLY);
+        queue.push(&ready, EARLY);
+        let only_ready = |p: &Pending| std::ptr::eq(p, Arc::as_ptr(&ready));
+        let popped = queue.pop(true, only_ready);
+        // the cold one is skipped (and counted, to leave the waiting count), the ready one made
+        assert_eq!(popped.skipped, 1);
+        let (p, early) = popped.made.unwrap();
+        assert!(Arc::ptr_eq(&p, &ready) && early);
+        assert_eq!(cold.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+        // its first use still queues it
+        assert_eq!(queue.push(&cold, REQUESTED), Some(true));
+        let (p, early) = queue.pop(true, |_| false).made.unwrap();
+        assert!(Arc::ptr_eq(&p, &cold) && !early);
     }
 }
