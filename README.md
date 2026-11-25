@@ -1,3 +1,43 @@
+# vicecitybaby (VIctory fork — RTX 5070 Ti / Wave32)
+
+Personal fork of [fxceless/victory-fork](https://github.com/fxceless/victory-fork) (based on [Marvisak/VIctory](https://github.com/Marvisak/VIctory)), tuned and verified on **Windows 11 x64, NVIDIA GeForce RTX 5070 Ti (16 GB, Wave32), 32 GB RAM**.
+
+**Verified status (2026-11-25):**
+- **Opening intro:** Plays smoothly without black-frame flashing/flickering.
+- **First gameplay room (prison):** **Walls, character faces, and prison lights all render together reliably** (~4.5 FPS, ~13.4/16 GB VRAM, ~27–29/32 GB RAM).
+
+### Key Fixes Included in This Branch
+
+#### 1. Missing Walls, Faces & Prison Lights
+- **Packed textures & full-card reupload (`310c6eb`):** Neighbouring textures packed into absent large-mip address ranges no longer evict each other from the upload queue (4 KiB overlap rule), and textures with an existing host copy still refresh when VRAM is full.
+- **DirectStorage `PhysicalPages` notifications (`#571`):** Tracks mapped physical pages in `xmem.rs` and notifies `victory_gpu::kernel_will_write` from `dstorage.rs` so cell-wall streaming writes that bypass `WriteWatch` are picked up.
+- **Full-card queue starvation & mip-stream reuploads (`#676`) + remap dirty tracking (`#606`):** Prevents uncreated slots from starving rechecks/remaps at the upload cap and immediately marks remapped staged textures dirty.
+- **Shadow buffer barriers & relay safety (`#583`, `#674`, `#591`, `#663`, `#675`, `#668`, `#685`):** Per-command-list `UAV <-> GENERIC_READ` barriers on shadow buffers, synchronized `find_all` snapshot reads and per-span `card_merge_relay` trimming, O(log R) `BlockRuns` watch cache, disjoint shadow refresh ranges, indirect-arg invalidation, and duplicate-`HostList` submission splitting.
+- **Typed 32-bit integer buffer views (`#684`) & CBV 64 KiB clamp:** Maps `R32*_UINT/SINT` typed SRV/UAVs to `_FLOAT` (matching `bufferLoad.f32`/`bufferStore.f32` in `lower.rs`) so bit-cast culling data isn't corrupted, and clamps CBV sizes to 64 KiB in `descriptor/host.rs` to prevent `0x887A0001` crashes.
+- **Prison lighting & shader stability:** Depth Bounds Test (`#82` / `c96b4f2`) + `reconcile_row_interp` and LDS bounds checks (`326a301`).
+
+#### 2. Flickering / Black-Frame Intro
+- **Frame-tick race fix (`#244`):** Prevents concurrent `frame::wait` calls from consuming the same frame tick.
+- **Unseen texture-change hashing (`e924142`):** Periodically re-hashes textures that change without `WriteWatch` notifications so intro video frames update reliably without flickering or stalling.
+- **Controlled early pipeline compilation (`ecb5ceb`) & offline cache (`#282`):** Caps early pipeline workers to 1/4 for already-translated shaders and supports `translate --cache --pipelines --used-pipelines`.
+- **Clean release execution:** Run `target\release\victory.exe` without `VICTORY_D3D12_DEBUG=1`, `VICTORY_CAPTURE_WORLD=1`, or verbose console `VICTORY_LOG` (heavy diagnostic logging/stderr spam causes splash/intro black-frame flashing).
+
+### Recommended Launch Settings (NVIDIA RTX 5070 Ti / Wave32)
+
+```powershell
+$env:VICTORY_HOST_MAX_WAVE = "32"
+# Optional: reduce RAM usage on 32 GB systems (~350-750 MB saved)
+$env:VICTORY_WINDOW_KB = "1024"
+$env:VICTORY_WINDOW_TAILS = "1"
+# Optional: skip repeated decoration-bake passes (see #594)
+$env:VICTORY_BAKE_TEXTURES_MS = "0"
+
+# Do NOT set VICTORY_D3D12_DEBUG=1 or VICTORY_SCISSOR_TEST=full (breaks prison lights)
+.\target\release\victory.exe run --execute D:\ProjectAmerica\game_scarlett_master.exe
+```
+
+---
+
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
