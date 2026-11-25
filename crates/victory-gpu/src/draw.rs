@@ -1690,7 +1690,7 @@ impl State {
         // Slots whose texture's memory the runtime mapped, unmapped or
         // wrote since the last pass are due again.
         host.texture_slots_remapped(frame);
-        let (due, census) = host.texture_slots_due(frame, 4096);
+        let (due, census) = host.texture_slots_due_for(frame, 4096, room);
         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
@@ -1841,8 +1841,12 @@ impl State {
             // before.
             if !room {
                 let has_its_texture = reupload_when_full()
-                    && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
+                    && heap.handle(index).is_some_and(|handle| {
+                        host.texture_slot_made_from(index, handle)
+                            || view_has_live_host_texture(crate::descriptor::view(handle))
+                    });
                 if !has_its_texture {
+                    host.texture_slot_full(index, write, frame, most);
                     refused += 1;
                     if refused > 256 {
                         break;
@@ -3320,6 +3324,26 @@ const LINE_LOOP: u32 = 18;
 const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
+/// Whether `view` already resolves to a live on-card host copy (`copy_state == 2`),
+/// so updating its descriptor slot or re-uploading into it allocates zero new
+/// VRAM even when the title rewrote the descriptor (e.g., sharper mip-streaming
+/// view or another slot sharing the same placed texture).
+fn view_has_live_host_texture(view: Option<View>) -> bool {
+    match view {
+        Some(View::Placed(false, resource, desc)) if resource[0] != 1 => {
+            let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+            crate::resource::placed_known(address, &resource)
+                .and_then(crate::resource::copy_state)
+                .is_some_and(|(state, _, _)| state == 2)
+        }
+        Some(View::Shader(object, _)) if crate::resource::title_fills(object as This) => {
+            crate::resource::copy_state(object as This)
+                .is_some_and(|(state, _, _)| state == 2)
+        }
+        _ => false,
+    }
+}
+
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
     // SAFETY: an open list.
@@ -3353,5 +3377,54 @@ pub(crate) fn depth_bounds(list: &HostList, min: f32, max: f32) {
     {
         // SAFETY: an open list on a device that supports depth bounds.
         unsafe { l1.OMSetDepthBounds(min, max) };
+    }
+}
+
+#[cfg(test)]
+mod full_card_tests {
+    use super::view_has_live_host_texture;
+    use crate::descriptor::View;
+
+    /// A mip-streaming view rewrite (different `MostDetailedMip`, new
+    /// descriptor record, even differing filler stack words `[1]`/`[13]`) of
+    /// a placed texture whose host copy is already alive on the card must be
+    /// recognized as zero-VRAM-cost by `view_has_live_host_texture`.
+    #[test]
+    fn mip_stream_view_rewrite_recognizes_existing_live_host_texture() {
+        let Some(_host) = crate::host::host() else {
+            return;
+        };
+        let mut backing = vec![0u8; 65536];
+        let address = backing.as_mut_ptr() as u64;
+        // 64x64 R8G8B8A8_UNORM (format 28), 4 mips, SW_4KB_S (0x105).
+        let mut resource = [3u32, 0x1111_2222, 0, 0, 64, 0, 64, 4 << 16 | 1, 28, 1, 0, 0x105, 0, 0x3333_4444];
+        let view_with = |res: [u32; 14], first_mip: u32| {
+            let mut desc = [0u32; 16];
+            desc[0] = 28;
+            desc[1] = 4; // TEXTURE2D
+            desc[4] = first_mip;
+            desc[5] = 4 - first_mip;
+            desc[10] = address as u32;
+            desc[11] = (address >> 32) as u32;
+            View::Placed(false, res, desc)
+        };
+        // Before any host copy exists: must be false.
+        assert!(!view_has_live_host_texture(Some(view_with(resource, 2))));
+
+        // Materialize the placed texture and its on-card host copy.
+        let tex = crate::resource::texture_at(address, &resource).expect("placed texture");
+        let _host_copy = crate::resource::host_copy(tex).expect("host copy created");
+
+        // Now a rewritten sharper-mip view with different filler words `[1]`/`[13]`
+        // must still resolve to the live on-card host texture.
+        resource[1] = 0x5555_6666;
+        resource[13] = 0x7777_8888;
+        assert!(view_has_live_host_texture(Some(view_with(resource, 0))));
+
+        // A buffer view or unknown address remains false.
+        assert!(!view_has_live_host_texture(None));
+        let mut other_desc = [0u32; 16];
+        other_desc[10] = 0x1000;
+        assert!(!view_has_live_host_texture(Some(View::Placed(false, resource, other_desc))));
     }
 }
