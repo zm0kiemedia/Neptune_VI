@@ -2403,6 +2403,7 @@ impl Shadow {
             if let Some((now, written)) = crate::watch::writes(from, to, true) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
+                self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -2421,6 +2422,63 @@ impl Shadow {
         #[cfg(feature = "diagnostics")]
         crate::copystat::whole(from, to - from, started.elapsed().as_micros() as u64);
         to - from
+    }
+
+    /// Diagnostic (`VICTORY_REFRESH_CHECK=1`; off by default): after a
+    /// refresh of `[from, to)` that trusted the write watch or the guards,
+    /// the first 256 bytes of every 64 KiB block of it are read from title
+    /// memory and compared with the copy. A block that differs on three
+    /// refreshes in a row was changed with nothing to tell of it (a write
+    /// through another view of its pages, as DirectStorage's page
+    /// destinations make) and the card reads old bytes there: said with
+    /// the copy and the address. One that differs once is a write of the
+    /// title's that arrived between the refresh and the look.
+    fn refresh_check(&self, from: usize, to: usize) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_REFRESH_CHECK").is_some_and(|v| v == "1") || crate::host::walls_trace()) {
+            return;
+        }
+        const SAMPLE: usize = 256;
+        // Blocks found differing: how many refreshes in a row.
+        static DIFFERING: Mutex<Option<std::collections::HashMap<usize, u32>>> = Mutex::new(None);
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        let start = self.start as usize;
+        let mut title = [0u8; SAMPLE];
+        let mut at = from;
+        while at < to {
+            let n = SAMPLE.min(to - at);
+            if crate::host::read_into(at as *const u8, &mut title[..n]) {
+                // SAFETY: `[from, to)` lies inside the buffer (`update`),
+                // so these bytes are inside the copy's mapping.
+                let copy = unsafe { std::slice::from_raw_parts(self.data.add(at - start).cast_const(), n) };
+                let mut map = DIFFERING.lock().unwrap_or_else(|e| e.into_inner());
+                let map = map.get_or_insert_with(Default::default);
+                if copy == &title[..n] {
+                    map.remove(&at);
+                } else {
+                    let times = map.entry(at).or_insert(0);
+                    *times += 1;
+                    if *times == 3 {
+                        let said = SAID.fetch_add(1, Ordering::Relaxed) + 1;
+                        if said <= 64 || said.is_power_of_two() {
+                            tracing::warn!(
+                                said,
+                                copy = self.id,
+                                copy_start = format_args!("{start:#x}"),
+                                copy_bytes = self.len,
+                                address = format_args!("{at:#x}"),
+                                refreshed = format_args!("{from:#x}..{to:#x}"),
+                                on_the_card = self.card.is_some(),
+                                window = self.window,
+                                "a host copy of title memory is stale after its refresh, three times in a row:                                  the memory changed with nothing to tell of it (VICTORY_REFRESH_CHECK=1)"
+                            );
+                        }
+                    }
+                }
+            }
+            // The first bytes of the next 64 KiB block.
+            at = (at / PAGE + 1) * PAGE;
+        }
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
@@ -2540,6 +2598,42 @@ impl Shadow {
     /// The offsets of piece `i` of `span` that lie in the span.
     pub(crate) fn card_piece(&self, span: &CardSpan, i: u32) -> (usize, usize) {
         card_piece_of(self.start as usize, self.len as usize, span, i)
+    }
+
+    /// The walls trace (`crate::host::walls_trace`): a piece of `fetched`
+    /// bytes of this copy came back from the card and `written` of them
+    /// went into title memory. Summed per buffer and logged once a frame:
+    /// which shader-written buffers the title's CPU could see fresh in
+    /// that frame, and how much of each changed.
+    pub(crate) fn walls_merged(&self, fetched: usize, written: usize) {
+        if !crate::host::walls_trace() {
+            return;
+        }
+        static SEEN: Mutex<(u64, BTreeMap<u64, (u64, u32, u64, u64)>)> = Mutex::new((0, BTreeMap::new()));
+        let frame = crate::frame::current();
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.0 != frame {
+            let buffers: Vec<String> = seen
+                .1
+                .iter()
+                .map(|(at, v)| format!("{at:#x}+{:#x}: {} pieces, {} fetched, {} written", v.0, v.1, v.2, v.3))
+                .take(32)
+                .collect();
+            if !buffers.is_empty() {
+                tracing::info!(
+                    frame = seen.0,
+                    count = seen.1.len(),
+                    buffers = ?buffers,
+                    "walls trace: shader-written card buffers merged into title memory in this frame"
+                );
+            }
+            seen.1.clear();
+            seen.0 = frame;
+        }
+        let entry = seen.1.entry(self.start).or_insert((self.len, 0, 0, 0));
+        entry.1 += 1;
+        entry.2 += fetched as u64;
+        entry.3 += written as u64;
     }
 
     /// After a submission, for a copy in the card's memory: `gpu` is what

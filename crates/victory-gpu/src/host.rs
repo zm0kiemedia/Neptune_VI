@@ -2692,6 +2692,19 @@ fn declared_writes(runs: &[&HostList]) -> Vec<Declared> {
     back
 }
 
+/// The walls trace (`VICTORY_WALLS_TRACE=1` or `2`; off by default): log
+/// lines that say what the title's CPU was given while it decided whether
+/// the camera is in a room. The values of the small read-backs
+/// ([`read_backs`]), the frame's main pass by scissor rectangle with its
+/// culling dispatches (`draw.rs`, `walls_census`), the shader-written
+/// buffers merged into title memory (`shadow.rs`, `walls_merged`), host
+/// copies found stale after their refresh (`shadow.rs`), and, in the
+/// runtime, the read requests that fail (with 2: every request).
+pub(crate) fn walls_trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WALLS_TRACE").is_some_and(|v| v == "1" || v == "2"))
+}
+
 /// After `list` has run: the texels its read-backs copied into host
 /// buffers of ours go to the title's memory (`HostList::defer_read_back`).
 ///
@@ -2710,6 +2723,19 @@ fn read_backs(list: &HostList) {
                 let from = data.cast::<u8>().cast_const();
                 for line in 0..*rows {
                     std::ptr::copy_nonoverlapping(from.add(line * row.next_multiple_of(256)), (*at as *mut u8).add(line * pitch), *row);
+                }
+                // The walls trace: what the title is handed (one row of at
+                // most 24 values: its 5x1 and 1x1 float targets).
+                if walls_trace() && *rows == 1 && *row <= 96 {
+                    let mut values = [0f32; 24];
+                    std::ptr::copy_nonoverlapping(from, values.as_mut_ptr().cast::<u8>(), *row & !3);
+                    tracing::info!(
+                        frame = crate::frame::current(),
+                        to = format_args!("{:#x}", *at),
+                        bytes = *row,
+                        values = ?&values[..*row / 4],
+                        "walls trace: a read-back lands in title memory"
+                    );
                 }
                 buffer.Unmap(0, None);
             }
@@ -3424,7 +3450,9 @@ impl Host {
             // SAFETY: the mapping of the fetched bytes, `total` of them;
             // the copy into it has run.
             let gpu = unsafe { std::slice::from_raw_parts((data + *at as usize) as *const u8, hi - lo) };
-            written += shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            let merged = shadow.card_merge_relay(*lo, gpu, after, &mut title);
+            shadow.walls_merged(gpu.len(), merged);
+            written += merged;
         }
         COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
         // Sends up to `after` are of no use to any later merge.
@@ -3653,7 +3681,9 @@ impl Host {
                                 // the copy into it has run, and the caller
                                 // waits for this job.
                                 let gpu = unsafe { std::slice::from_raw_parts((fetched + at as usize) as *const u8, hi - lo) };
-                                counts[i].fetch_add(shadow.card_merge(lo, gpu, &mut title), Ordering::Relaxed);
+                                let merged = shadow.card_merge(lo, gpu, &mut title);
+                                shadow.walls_merged(gpu.len(), merged);
+                                counts[i].fetch_add(merged, Ordering::Relaxed);
                             }
                         }) as Box<dyn FnOnce() + Send>
                     })
@@ -3668,7 +3698,9 @@ impl Host {
                     // SAFETY: the mapping of the fetched bytes, `total` of
                     // them; the copy into it has run.
                     let gpu = unsafe { std::slice::from_raw_parts((*data + at as usize) as *const u8, hi - lo) };
-                    written[i] += plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
+                    let merged = plan.ranges[i].shadow.card_merge(lo, gpu, &mut title);
+                    plan.ranges[i].shadow.walls_merged(gpu.len(), merged);
+                    written[i] += merged;
                 }
             }
         }
@@ -5978,7 +6010,17 @@ impl Host {
                     .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
             };
             match resized {
-                Ok(()) => (p.width, p.height, p.format) = (width, height, format),
+                Ok(()) => {
+                    (p.width, p.height, p.format) = (width, height, format);
+                    tracing::info!(
+                        width,
+                        height,
+                        format = format.0,
+                        frame,
+                        "the swap chain's buffers were made again for another size or format"
+                    );
+                    self.log_video_memory("right after the swap chain's buffers were made again");
+                }
                 Err(e) => {
                     tracing::warn!(error = %e, width, height, "swap chain not resized");
                     return None;
@@ -6072,6 +6114,7 @@ impl Host {
             Some(hwnd) => hwnd,
             None => window(width, height)?,
         };
+        self.log_video_memory("right before the swap chain is made");
         // SAFETY: plain object creation for our window.
         unsafe {
             let factory: IDXGIFactory2 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
@@ -6094,6 +6137,7 @@ impl Host {
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
+            self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
                 width,
@@ -6173,7 +6217,69 @@ impl Host {
                 .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
                 .ok()?;
         }
+        // The card's budget moved by 256 MB or more since the last look:
+        // said at once, with what was in use at the last look, so the log
+        // has the moment. (It fell from 11,242 MB to some 10,300 MB with
+        // the first world frame in runs 179 to 185, and the memory line,
+        // seconds later, was the first to show it. We reserve nothing
+        // and make the swap chain once, at the start.)
+        static LAST: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+        let now = [own.Budget, own.CurrentUsage, shared.CurrentUsage];
+        let last = [0, 1, 2].map(|i| LAST[i].swap(now[i], Ordering::Relaxed));
+        if last[0] != 0 && last[0].abs_diff(own.Budget) >= (256u64 << 20) {
+            tracing::info!(
+                "the system changed the budget of the card's memory from {} MB to {} MB (frame {}); at the last look {} MB of the card's and {} MB of the PC's shared memory were in use",
+                last[0] >> 20,
+                own.Budget >> 20,
+                crate::frame::current(),
+                last[1] >> 20,
+                last[2] >> 20
+            );
+            self.log_video_memory("right after that change");
+        }
         Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+    }
+
+    /// Both of the system's memory groups for this process, in bytes: for
+    /// the card's own memory and then for the PC's memory shared with the
+    /// card, the budget, the use, what could still be reserved and what
+    /// is reserved (the layer reserves none).
+    pub(crate) fn video_memory_groups(&self) -> Option<[[u64; 4]; 2]> {
+        let adapter = self.adapter.as_ref()?;
+        let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        let mut shared = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        // SAFETY: plain queries that fill our structures.
+        unsafe {
+            adapter
+                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut own)
+                .ok()?;
+            adapter
+                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut shared)
+                .ok()?;
+        }
+        let all = |m: &DXGI_QUERY_VIDEO_MEMORY_INFO| {
+            [m.Budget, m.CurrentUsage, m.AvailableForReservation, m.CurrentReservation]
+        };
+        Some([all(&own), all(&shared)])
+    }
+
+    /// Logs [`Self::video_memory_groups`], with `when` it is said.
+    pub(crate) fn log_video_memory(&self, when: &str) {
+        let Some([own, shared]) = self.video_memory_groups() else {
+            return;
+        };
+        tracing::info!(
+            "video memory as the system counts it, {}: the card's own: budget {} MB, in use {} MB, {} MB could still be reserved, {} MB reserved; the PC's shared with the card: budget {} MB, in use {} MB, {} MB could still be reserved, {} MB reserved (the layer reserves none)",
+            when,
+            own[0] >> 20,
+            own[1] >> 20,
+            own[2] >> 20,
+            own[3] >> 20,
+            shared[0] >> 20,
+            shared[1] >> 20,
+            shared[2] >> 20,
+            shared[3] >> 20
+        );
     }
 
     /// A buffer in system memory that the CPU maps (write-back, so reading

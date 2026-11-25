@@ -690,6 +690,11 @@ fn log_memory() {
     let card = crate::host::host()
         .and_then(|h| h.video_memory())
         .unwrap_or_default();
+    // Everything the system says of the two memory groups, beside the
+    // budget and use the lines below print.
+    if let Some(h) = crate::host::host() {
+        h.log_video_memory("with the memory line");
+    }
     // What else holds memory: the map, on a thread of its own, with every
     // sixth line; and what the shader table and the pipeline library keep.
     static LINES: AtomicU64 = AtomicU64::new(0);

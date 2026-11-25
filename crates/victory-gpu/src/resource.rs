@@ -1402,6 +1402,210 @@ fn room_percent() -> u64 {
     })
 }
 
+/// For the card accounting line ([`card_accounting`]): the title texture
+/// made for a view of memory at `address` with the resource description
+/// `desc`, if there is one ([`texture_at`] makes it; this does not).
+#[cfg(windows)]
+pub(crate) fn placed_known(address: u64, desc: &[u32; 14]) -> Option<This> {
+    // Without the filler words and with them: whichever `texture_at` keeps.
+    let mut key = *desc;
+    key[1] = 0;
+    key[13] = 0;
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(&(address, key)).or_else(|| map.get(&(address, *desc))).map(|&r| r as This)
+}
+
+/// For the card accounting line: whether title texture `this` has a host
+/// copy now (2), had one that was let go and not made again (1), or never
+/// had one (0); the bytes (its host copy's on the card, or without one
+/// what its console layout takes in title memory); and where its title
+/// memory is. `None` for buffers. Not a use of the texture.
+#[cfg(windows)]
+pub(crate) fn copy_state(this: This) -> Option<(u8, u64, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let memory = r.data() as u64;
+    let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+    Some(match made.as_ref() {
+        Some((host, _)) => (2, host.bytes, memory),
+        None => (u8::from(r.host.gone.load(Relaxed)), footprint(&r.desc).map_or(0, |f| f.size), memory),
+    })
+}
+
+/// One line of where the card's memory is and what the queue of textures
+/// picked by index would need (`VICTORY_CARD_ACCOUNTING=1`; `draw.rs`
+/// `card_accounting` says when, and hands over the queue's side: `room`
+/// as the pass found it, `due` its counts, `never` and `gone` the memory
+/// of the due textures without a host copy). The line holds
+/// - the host copies of textures the title fills that are alive: how
+///   many, their bytes, and the bytes of the levels whose title memory is
+///   not mapped (a host copy is made with every level of the description;
+///   a texture streaming in has its small levels only). A copy's bytes
+///   are shared out to its levels by their texels, so that part is an
+///   estimate;
+/// - the due slots: how many, and their textures by what they have on
+///   the card (a host copy alive: no card memory needed; never one; one
+///   that was let go), with the bytes the last two would need and how
+///   much of their memory is mapped now;
+/// - the host copies let go, made again and made since the line before.
+///
+/// The textures are noted under the table's lock (their memory, their
+/// description, their copy's bytes: about a millisecond for 18,000) and
+/// the kernel is asked about their memory on a thread of its own, after
+/// the lock is given back: one question for a texture that is all there
+/// (up to 256 pages each; 18,000 textures of 5.5 GB are 1.4 million
+/// pages, some 20,000 questions), one per level and array slice more for
+/// one that is not. Not measured: a tenth to half a second is expected,
+/// and the line says what it took. No line is begun while one is walking.
+#[cfg(windows)]
+pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>, gone: Vec<(u64, u64)>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    // Host copies let go and their bytes, made again and their bytes, and
+    // made in all, at the line before.
+    static BEFORE: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+    if WALKING.swap(true, Relaxed) {
+        return;
+    }
+    let began = std::time::Instant::now();
+    let mut copies: Vec<(usize, ResourceDesc, u64)> = Vec::new();
+    // Textures the title fills without a host copy: never one, one let go.
+    let mut without = [0u64; 2];
+    {
+        let all = textures();
+        for &at in all.iter() {
+            // SAFETY: as in `let_go_idle`.
+            let r = unsafe { &*(at as *const Resource) };
+            if !fills(&r.desc) {
+                continue;
+            }
+            let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+            match made.as_ref() {
+                Some((host, _)) => copies.push((r.data() as usize, r.desc, host.bytes)),
+                None => without[usize::from(r.host.gone.load(Relaxed))] += 1,
+            }
+        }
+    }
+    let kinds = KINDS.each_ref().map(|k| k.load(Relaxed));
+    let mut since = [0u64; 5];
+    for ((slot, now), before) in since.iter_mut().zip([kinds[2], kinds[3], kinds[4], kinds[5], kinds[6]]).zip(&BEFORE) {
+        *slot = now.saturating_sub(before.swap(now, Relaxed));
+    }
+    let video = crate::host::host().and_then(|h| h.video_memory());
+    let noted_us = began.elapsed().as_micros() as u64;
+    let walk = move || {
+        fn texels(m: &texture::Mip) -> u64 {
+            u64::from(m.width) * u64::from(m.height) * u64::from(m.depth)
+        }
+        let began = std::time::Instant::now();
+        // Copies; their bytes; the bytes of levels not mapped; copies with
+        // a level not mapped; with the largest level not mapped; with no
+        // level mapped; copies without a console layout (not asked).
+        let mut c = [0u64; 7];
+        for &(memory, desc, bytes) in &copies {
+            c[0] += 1;
+            c[1] += bytes;
+            let Some(layout) = texture_layout(&desc).map(|t| t.planes[0].layout.clone()) else {
+                c[6] += 1;
+                continue;
+            };
+            if layout.size == 0 || crate::texture::committed(memory as *const u8, layout.size as usize) {
+                continue;
+            }
+            c[3] += 1;
+            // Every slice holds the whole chain: the levels of the tail in
+            // its first block, the others after it from the smallest up
+            // (`victory_formats::texture::Layout`).
+            let mips = &layout.mips;
+            let tail = (layout.first_tail_mip as usize).min(mips.len());
+            let there = |from: u64, to: u64| {
+                (0..u64::from(layout.slices)).all(|slice| {
+                    let at = memory as u64 + slice * layout.slice_size + from;
+                    crate::texture::committed(at as *const u8, (to - from) as usize)
+                })
+            };
+            let all: u64 = mips.iter().map(texels).sum::<u64>().max(1);
+            let (mut missing, mut any) = (0u64, false);
+            for (level, m) in mips.iter().enumerate().take(tail) {
+                let end = if level == 0 { layout.slice_size } else { mips[level - 1].offset };
+                if end <= m.offset {
+                    continue;
+                }
+                if there(m.offset, end) {
+                    any = true;
+                } else {
+                    missing += texels(m);
+                    c[4] += u64::from(level == 0);
+                }
+            }
+            if tail < mips.len() {
+                if there(0, layout.alignment.min(layout.slice_size).max(1)) {
+                    any = true;
+                } else {
+                    missing += mips[tail..].iter().map(texels).sum::<u64>();
+                }
+            }
+            c[2] += (u128::from(bytes) * u128::from(missing) / u128::from(all)) as u64;
+            c[5] += u64::from(!any);
+        }
+        // Of the due textures without a host copy: how many; the bytes of
+        // their memory; with all of it mapped, and those bytes; with part
+        // of it mapped, and the bytes that are; with none of it mapped.
+        let mapped = |list: &[(u64, u64)]| {
+            let mut n = [0u64; 7];
+            for &(at, len) in list {
+                n[0] += 1;
+                n[1] += len;
+                let there = crate::texture::mapped_bytes(at as *const u8, len as usize);
+                if len > 0 && there >= len {
+                    n[2] += 1;
+                    n[3] += len;
+                } else if there > 0 {
+                    n[4] += 1;
+                    n[5] += there;
+                } else {
+                    n[6] += 1;
+                }
+            }
+            n
+        };
+        let (never, gone) = (mapped(&never), mapped(&gone));
+        let [budget_mb, used_mb] = video.map_or([0, 0], |v| [v[0] >> 20, v[1] >> 20]);
+        let [copies_n, copies_mb, unmapped_mb, partly, largest, nothing, unknown] =
+            [c[0], c[1] >> 20, c[2] >> 20, c[3], c[4], c[5], c[6]];
+        let [without_never, without_gone] = without;
+        let [due_slots, due_uploaded, due_other, alive_n, alive_mb] = [due[0], due[1], due[2], due[3], due[4] >> 20];
+        let [never_n, never_mb, never_whole, never_whole_mb, never_part, never_part_mb, never_none] =
+            [never[0], never[1] >> 20, never[2], never[3] >> 20, never[4], never[5] >> 20, never[6]];
+        let [gone_n, gone_mb, gone_whole, gone_whole_mb, gone_part, gone_part_mb, gone_none] =
+            [gone[0], gone[1] >> 20, gone[2], gone[3] >> 20, gone[4], gone[5] >> 20, gone[6]];
+        let [let_go, let_go_mb, again, again_mb, made] = [since[0], since[1] >> 20, since[2], since[3] >> 20, since[4]];
+        let walk_ms = began.elapsed().as_millis() as u64;
+        tracing::info!(
+            "card accounting: room {room}, the card {used_mb} MB in use of a budget of {budget_mb} MB; host copies of textures the title \
+             fills: {copies_n} alive {copies_mb} MB, of which {unmapped_mb} MB are levels whose title memory is not mapped ({partly} copies \
+             with such a level, {largest} of them the largest level, {nothing} with no level mapped; {unknown} without a console layout, not \
+             asked); title textures without a host copy: {without_never} never had one, {without_gone} had one let go; due slots: \
+             {due_slots} ({due_uploaded} uploaded before, {due_other} of nothing the title fills), their textures: {alive_n} with a host \
+             copy alive ({alive_mb} MB, no card memory needed); {never_n} that never had one ({never_mb} MB of title memory: {never_whole} \
+             all mapped {never_whole_mb} MB, {never_part} in part {never_part_mb} MB mapped, {never_none} not mapped); {gone_n} whose host \
+             copy was let go ({gone_mb} MB: {gone_whole} all mapped {gone_whole_mb} MB, {gone_part} in part {gone_part_mb} MB mapped, \
+             {gone_none} not mapped); since the line before: {let_go} host copies let go {let_go_mb} MB, {again} made again {again_mb} MB, \
+             {made} made in all; noting took {noted_us} us on the frame's thread, the walk {walk_ms} ms on its own"
+        );
+        WALKING.store(false, Relaxed);
+    };
+    if std::thread::Builder::new().name("card accounting".into()).spawn(walk).is_err() {
+        WALKING.store(false, Relaxed);
+    }
+}
+
 /// Lets go of the host copies of textures the title fills that nothing
 /// names any more: placed textures were never released (one host texture
 /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
@@ -2065,6 +2269,19 @@ pub(crate) fn placed_bytes(desc: &[u32; 14]) -> Option<u64> {
         return None;
     }
     footprint(&d).map(|f| f.size)
+}
+
+/// The resource [`texture_at`] made for a texture placed at `address` with
+/// the description `desc`, if it has made one: never made here (for the
+/// frame listing, which must not count as a use).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn texture_at_made(address: u64, desc: &[u32; 14]) -> Option<This> {
+    let mut key = *desc;
+    key[1] = 0;
+    key[13] = 0;
+    let map = PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let found = map.get(&(address, key)).or_else(|| map.get(&(address, *desc)))?;
+    Some(*found as This)
 }
 
 /// The resource for a texture placed at `address` with the resource

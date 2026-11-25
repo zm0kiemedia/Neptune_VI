@@ -959,6 +959,16 @@ pub(crate) fn fingerprint(at: u64, len: u64) -> u64 {
 
 /// Whether a title texture has a staging buffer: a list recorded its
 /// upload, and the lists that sample it check it at submission.
+/// For the frame listing: whether a list has uploaded `resource`'s staging
+/// buffer, and whether it was detiled since. None: it has none.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn staged_state(resource: This) -> Option<(bool, bool)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+    let staging = map.as_ref()?.get(&(resource as usize))?;
+    Some((staging.uploaded.load(Relaxed), staging.dirty.load(Relaxed)))
+}
+
 pub(crate) fn is_staged(resource: This) -> bool {
     let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
     map.as_ref().is_some_and(|map| map.contains_key(&(resource as usize)))

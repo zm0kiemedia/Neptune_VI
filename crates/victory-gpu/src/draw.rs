@@ -381,6 +381,18 @@ const RECHECK_FRAMES: [u64; 5] = [4, 12, 40, 120, 400];
 /// was, and that found it changed (uploaded again), since the start.
 pub(crate) static HEAP_TEXTURES_RECHECKED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// Uploads of textures already on the card made while it had no room for
+/// new ones, since the start.
+pub(crate) static HEAP_TEXTURES_REUPLOADED_FULL: AtomicU64 = AtomicU64::new(0);
+
+/// Whether a texture that has its host copy is still brought up to date
+/// while the card has no room for new ones (`VICTORY_REUPLOAD_WHEN_FULL=0`:
+/// no).
+fn reupload_when_full() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_REUPLOAD_WHEN_FULL").is_none_or(|v| v != "0"))
+}
+
 /// Whether textures picked by index are looked at again after their upload
 /// (`VICTORY_HEAP_RECHECK=0`: no).
 fn heap_recheck() -> bool {
@@ -913,6 +925,9 @@ impl State {
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
+        if crate::host::walls_trace() {
+            self.walls_census(p, compute);
+        }
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -1550,6 +1565,77 @@ impl State {
         }
     }
 
+    /// The queue's side of the card accounting line
+    /// (`crate::resource::card_accounting`, which says what the line
+    /// holds): the slots that are due, by what their texture has on the
+    /// card. Off unless `VICTORY_CARD_ACCOUNTING=1`; then at the first pass
+    /// that finds the card without room, and every five seconds after it.
+    /// Nothing is made, uploaded or counted as used here. For 18,000 due
+    /// slots: 18,000 looks at a title slot and at the texture it views, a
+    /// lock each, some milliseconds of the thread that records the frame.
+    fn card_accounting(
+        heap: &crate::descriptor::Heap,
+        host: &crate::descriptor::host::HostHeap,
+        frame: u64,
+        room: bool,
+    ) {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_CARD_ACCOUNTING").is_some_and(|v| v == "1")) {
+            return;
+        }
+        // When the next line is due (0: none yet, the card has had room).
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let now = crate::host::now_ms().max(1);
+        let next = NEXT.load(Ordering::Relaxed);
+        let due_now = if next == 0 { !room } else { now >= next };
+        if !due_now || NEXT.compare_exchange(next, now + 5000, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+            return;
+        }
+        // Due slots; of them uploaded before; of them viewing nothing the
+        // title fills; and the textures (each once) whose host copy is
+        // alive, with their bytes on the card.
+        let mut due = [0u64; 5];
+        // Textures (each once) that never had a host copy, and ones whose
+        // host copy was let go: where their memory is, and its bytes.
+        let (mut never, mut gone) = (Vec::new(), Vec::new());
+        let mut seen = std::collections::BTreeSet::new();
+        for (index, uploaded) in host.texture_slots_all_due(frame) {
+            due[0] += 1;
+            due[1] += u64::from(uploaded);
+            let state = match heap.handle(index).and_then(crate::descriptor::view) {
+                Some(View::Placed(false, resource, desc)) if resource[0] != 1 => {
+                    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+                    match crate::resource::placed_known(address, &resource) {
+                        Some(texture) => crate::resource::copy_state(texture),
+                        // No title texture was made for it: the pass never
+                        // got as far as making one.
+                        None => Some((0, crate::resource::placed_bytes(&resource).unwrap_or(0), address)),
+                    }
+                }
+                Some(View::Shader(object, _)) if crate::resource::title_fills(object as This) => {
+                    crate::resource::copy_state(object as This)
+                }
+                _ => None,
+            };
+            let Some((state, bytes, memory)) = state else {
+                due[2] += 1;
+                continue;
+            };
+            if !seen.insert(memory) {
+                continue;
+            }
+            match state {
+                2 => {
+                    due[3] += 1;
+                    due[4] += bytes;
+                }
+                1 => gone.push((memory, bytes)),
+                _ => never.push((memory, bytes)),
+            }
+        }
+        crate::resource::card_accounting(room, due, never, gone);
+    }
+
     /// The texture side of [`State::heap_buffers`]: textures the title fills
     /// itself (streamed pages, layout-library copies) whose views sit in the
     /// view heap are created (placed textures have no host texture until
@@ -1609,6 +1695,10 @@ impl State {
         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
             count.store(now, Ordering::Relaxed);
         }
+        // Where the card's memory is, and what the due slots would need
+        // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
+        // room, and every five seconds after it).
+        Self::card_accounting(heap, host, frame, room);
         // The frames in about four seconds, between 16 and 256: how long a
         // slot with nothing to upload waits at most for its next look. In
         // frames alone it was 120: four minutes at the opening cutscene's
@@ -1738,12 +1828,35 @@ impl State {
             }
             // From here on a host texture is made: not without room. The
             // slot stays due.
+            // Not so a slot already made from this very view: its host
+            // texture exists, and uploading it again takes none of the
+            // card's memory. It was refused all the same, so a texture the
+            // title filled after its first upload kept its empty host copy
+            // from the moment the card reached the line, which is the first
+            // world frame in eight launches of nine: the same slots were
+            // found changed again at every pass and never uploaded (run
+            // 179: 33,000 such findings), and the main character's face
+            // had its colour only in the launches that entered the world
+            // under the line. `VICTORY_REUPLOAD_WHEN_FULL=0`: refused, as
+            // before.
             if !room {
-                refused += 1;
-                if refused > 256 {
-                    break;
+                let has_its_texture = reupload_when_full()
+                    && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
+                if !has_its_texture {
+                    refused += 1;
+                    if refused > 256 {
+                        break;
+                    }
+                    continue;
                 }
-                continue;
+                let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n.is_multiple_of(500) {
+                    tracing::info!(
+                        so_far = n,
+                        slot = index,
+                        "a texture already on the card is brought up to date although the card has no room for new ones"
+                    );
+                }
             }
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
@@ -1976,7 +2089,178 @@ impl State {
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
+        if !compute && !list_slots().is_empty() {
+            text.push_str(&self.slots_text());
+        }
         text
+    }
+
+    /// For the frame listing, after a draw whose shader `VICTORY_LIST_SLOTS`
+    /// names: the heap slots it will pick textures from by index, and what
+    /// the title and the host hold there (one `~slot` line each), with the
+    /// words they were read from (`~raw` lines, to decode offline what is
+    /// not decoded here).
+    ///
+    /// Where the slots are, for the title's character shaders
+    /// (`PS_DeferredPedTexturedNC`, from their native code): in the small
+    /// buffers and constants of the draw's own table (every word of those
+    /// that names a texture view gets a line); in the material record, at
+    /// the byte offset the draw's constants (table 1, dword 56) hold at
+    /// 0x1c, of the buffer at table 0, dword 160; and in the record at the
+    /// byte offset the second root constant holds of the buffer at table 0,
+    /// dword 688. A word that is a small number by chance and names a
+    /// texture gets a line too.
+    #[cfg(feature = "diagnostics")]
+    fn slots_text(&self) -> String {
+        use std::fmt::Write;
+        const MATERIALS: u32 = 160;
+        const GLOBAL: u32 = 688;
+        const DRAW_CONSTANTS: u32 = 56;
+        let wanted = list_slots();
+        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+            return String::new();
+        };
+        let Some(stage) = p.stages.iter().find(|s| wanted.iter().any(|w| s.shader.hash.starts_with(w.as_str())))
+        else {
+            return String::new();
+        };
+        let Some(heap) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find(|h| !h.samplers())
+        else {
+            return String::new();
+        };
+        let t = stage.translated();
+        let mut text = String::new();
+        let entry = |slot: u8, dwords: u32| -> Option<View> {
+            let Some(Root::Table(table)) = self.roots_ref(false).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::view(table + u64::from(dwords) * 4)
+        };
+        let mut material = None;
+        for u in t.used.iter().filter(|u| u.root == RootType::Table && u.kind != ResourceType::Sampler) {
+            let label = format!("s{}+{}", u.slot, u.table_offset_dwords);
+            let Some(view) = entry(u.slot, u.table_offset_dwords) else {
+                let _ = write!(text, "\n    ~table {label} no view");
+                continue;
+            };
+            let range = match &view {
+                View::Constant(address, size) => Some((*address, u64::from(*size))),
+                other => crate::descriptor::host::buffer_range(other),
+            };
+            match range {
+                // A small buffer or constants: its words.
+                Some((address, len)) if len <= 2048 => {
+                    Self::slot_words(&mut text, heap, &label, address, len as usize);
+                    if u.slot == 1 && u.table_offset_dwords == DRAW_CONSTANTS && len >= 0x20 {
+                        let mut word = [0u8; 4];
+                        if crate::host::read_into((address + 0x1c) as *const u8, &mut word) {
+                            material = Some(u32::from_le_bytes(word));
+                        }
+                    }
+                }
+                Some(_) => {}
+                // A texture read through the table: the title slot it sits in.
+                None => {
+                    let Some(Root::Table(table)) = self.roots_ref(false).get(usize::from(u.slot)) else {
+                        continue;
+                    };
+                    match heap.index(table + u64::from(u.table_offset_dwords) * 4) {
+                        Some(index) => text.push_str(&Self::slot_line(heap, &format!("table:{label}"), 0, index)),
+                        None => {
+                            let _ = write!(text, "\n    ~table {label} title=[{}]", view_state(Some(&view)));
+                        }
+                    }
+                }
+            }
+        }
+        let uses = |slot: u8, dwords: u32| {
+            t.used.iter().any(|u| u.root == RootType::Table && u.slot == slot && u.table_offset_dwords == dwords)
+        };
+        if let Some(at) = material
+            && uses(0, MATERIALS)
+            && let Some((base, len)) = entry(0, MATERIALS).as_ref().and_then(crate::descriptor::host::buffer_range)
+        {
+            let at = u64::from(at);
+            let _ = write!(text, "\n    ~material record at {at:#x} of the buffer at {base:#x} bytes {len}");
+            if at + 64 <= len {
+                Self::slot_words(&mut text, heap, "M", base + at, 64);
+            }
+            if at + 1936 + 512 <= len {
+                Self::slot_words(&mut text, heap, "M+1936", base + at + 1936, 512);
+            }
+        }
+        if uses(0, GLOBAL)
+            && let Some(slot) = t.used.iter().find(|u| u.root == RootType::Constants).map(|u| u.slot)
+            && let Some(Root::Constants(words)) = self.roots_ref(false).get(usize::from(slot))
+            && let Some(&at) = words.get(1)
+            && let Some((base, len)) = entry(0, GLOBAL).as_ref().and_then(crate::descriptor::host::buffer_range)
+        {
+            let at = u64::from(at);
+            let _ = write!(text, "\n    ~root constants {words:08x?}: record at {at:#x} of the buffer at {base:#x} bytes {len}");
+            if at + 64 <= len {
+                Self::slot_words(&mut text, heap, "G", base + at, 64);
+            }
+        }
+        text
+    }
+
+    /// Up to 512 bytes of title memory at `address` as hex words (a `~raw`
+    /// line), and a `~slot` line for every word of them that names a
+    /// texture view in `heap`.
+    #[cfg(feature = "diagnostics")]
+    fn slot_words(text: &mut String, heap: &crate::descriptor::Heap, label: &str, address: u64, len: usize) {
+        use std::fmt::Write;
+        let mut bytes = vec![0u8; len.min(512) & !3];
+        if bytes.is_empty() || !crate::host::read_into(address as *const u8, &mut bytes) {
+            let _ = write!(text, "\n    ~raw {label} at {address:#x} bytes {len}: unreadable");
+            return;
+        }
+        let words: Vec<u32> =
+            bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect();
+        let _ = write!(text, "\n    ~raw {label} at {address:#x} bytes {len}:");
+        for w in &words {
+            let _ = write!(text, " {w:08x}");
+        }
+        for (i, &index) in words.iter().enumerate() {
+            let names = index != 0
+                && heap
+                    .handle(index)
+                    .and_then(crate::descriptor::view)
+                    .as_ref()
+                    .is_some_and(crate::descriptor::host::is_texture_view);
+            if names {
+                text.push_str(&Self::slot_line(heap, label, i * 4, index));
+            }
+        }
+    }
+
+    /// One `~slot` line: where the slot number was read (`from`, byte
+    /// `at`), what the title's heap holds in slot `index` with the state
+    /// of that texture ([`view_state`]), what the host slot was made from,
+    /// and what the queue of textures picked by index knows of it.
+    #[cfg(feature = "diagnostics")]
+    fn slot_line(heap: &crate::descriptor::Heap, from: &str, at: usize, index: u32) -> String {
+        let title = heap.handle(index).and_then(crate::descriptor::view);
+        let host: String = heap
+            .host()
+            .and_then(|h| h.describe_slot(index))
+            .unwrap_or_else(|| "none".into())
+            .chars()
+            .take(90)
+            .collect();
+        let queue = match heap.host() {
+            Some(h) => h.texture_slot_state(index, crate::frame::current()),
+            None => "no host heap".into(),
+        };
+        format!(
+            "\n    ~slot from={from}+{at:#x} slot={index} title=[{}] host=[{host}] queue=[{queue}]",
+            view_state(title.as_ref())
+        )
     }
 
     /// A mesh draw under `VICTORY_MESH_TEST=scissor` rasterises one pixel:
@@ -2019,6 +2303,74 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
+        }
+    }
+
+    /// The walls trace (`crate::host::walls_trace`): one log line per
+    /// frame with the draws of its main pass (four or more colour targets)
+    /// by scissor rectangle, and how often each of the title's culling
+    /// programs was dispatched. The title clips what it draws
+    /// through a window or door to that opening's rectangle while it holds
+    /// the camera to be in a room (run 182, frame 1529: 1,386 draws under
+    /// `531 0 1789 1337`); in a launch without the room's walls the same
+    /// shot has no such rectangle (run 187, frame 1414). The line shows
+    /// the frame in which that changes.
+    fn walls_census(&self, p: &HostPipeline, compute: bool) {
+        const CULL: [(&str, &str); 9] = [
+            ("55679a0547649d0b", "tree"),
+            ("89d08e561897d4e5", "tree_imposter"),
+            ("9209777e8face9dd", "grass"),
+            ("17af15c4015cb4b6", "prop"),
+            ("fdd56d97a806bcca", "prop_nocull"),
+            ("42f717f1b4d18e94", "simple"),
+            ("1c4b3c0547e3e6fa", "slod"),
+            ("9146291b38ea9ce1", "meshlet_args"),
+            ("42683eebec081520", "depth_pyramid_cpu_occlusion"),
+        ];
+        type Census = (u64, std::collections::BTreeMap<[i32; 4], u32>, [u32; 9]);
+        static CENSUS: std::sync::Mutex<Census> =
+            std::sync::Mutex::new((u64::MAX, std::collections::BTreeMap::new(), [0; 9]));
+        let frame = crate::frame::current();
+        let mut census = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+        if census.0 != frame {
+            let draws: u32 = census.1.values().sum();
+            if draws > 0 {
+                let mut rects: Vec<([i32; 4], u32)> = census.1.iter().map(|(r, n)| (*r, *n)).collect();
+                rects.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                let scissors: Vec<String> = rects
+                    .iter()
+                    .take(5)
+                    .map(|(r, n)| format!("{} {} {} {} x{n}", r[0], r[1], r[2], r[3]))
+                    .collect();
+                let counts = census.2;
+                let culling: Vec<String> = CULL
+                    .iter()
+                    .zip(counts)
+                    .filter(|(_, n)| *n > 0)
+                    .map(|(c, n)| format!("{}={n}", c.1))
+                    .collect();
+                tracing::info!(
+                    frame = census.0,
+                    main_pass_draws = draws,
+                    rectangles = rects.len(),
+                    scissors = ?scissors,
+                    culling = ?culling,
+                    "walls trace: the frame's main pass by scissor rectangle, and its culling dispatches"
+                );
+            }
+            census.0 = frame;
+            census.1.clear();
+            census.2 = [0; 9];
+        }
+        if compute {
+            for (i, c) in CULL.iter().enumerate() {
+                if p.stages.iter().any(|s| s.shader.hash.as_str() == c.0) {
+                    census.2[i] += 1;
+                }
+            }
+        } else if self.targets.iter().filter(|&&t| t != 0).count() >= 4 {
+            let r = self.scissors.first().map_or([0; 4], |r| [r.left, r.top, r.right, r.bottom]);
+            *census.1.entry(r).or_insert(0) += 1;
         }
     }
 
@@ -2813,6 +3165,109 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             }
         }
         _ => {}
+    }
+}
+
+/// The pixel shaders whose draws get their slots listed
+/// ([`State::slots_text`]): `VICTORY_LIST_SLOTS`, hash prefixes separated
+/// by commas. None by default.
+#[cfg(feature = "diagnostics")]
+fn list_slots() -> &'static [String] {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LIST.get_or_init(|| {
+        std::env::var("VICTORY_LIST_SLOTS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+}
+
+/// A fingerprint of the 4 KiB of title memory at `at` (FNV-1a, 64 bits; of
+/// 4 KiB of zeros it is always the same value, which `slots.py` knows), or
+/// "unreadable".
+#[cfg(feature = "diagnostics")]
+fn print_4k(at: u64) -> String {
+    let mut bytes = [0u8; 4096];
+    if at == 0 || !crate::host::read_into(at as *const u8, &mut bytes) {
+        return "unreadable".into();
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for b in bytes {
+        hash = (hash ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// The `bytes` of title memory at `at`: how many are mapped, and the
+/// fingerprints of the first and the last 4 KiB (a texture's smallest
+/// levels lie first, its largest last).
+#[cfg(feature = "diagnostics")]
+fn memory_state(at: u64, bytes: u64) -> String {
+    let mapped = crate::texture::mapped_bytes(at as *const u8, bytes as usize);
+    let last = at + bytes.saturating_sub(4096);
+    format!("memory={at:#x} mapped={mapped}/{bytes} first4k={} last4k={}", print_4k(at), print_4k(last))
+}
+
+/// Title texture `this` for the frame listing: its size, whether it has a
+/// host copy (not made here), its staging buffer's state, whether the host
+/// copied into it, and its memory ([`memory_state`]).
+#[cfg(feature = "diagnostics")]
+fn texture_state(this: This) -> String {
+    let Some((at, desc)) = crate::resource::texture_memory(this) else {
+        return "not a texture".into();
+    };
+    // SAFETY: 56 bytes in the description's layout.
+    let words = unsafe { std::ptr::from_ref(&desc).cast::<[u32; 14]>().read_unaligned() };
+    let bytes = crate::resource::placed_bytes(&words).unwrap_or(0);
+    let staged = match crate::texture::staged_state(this) {
+        Some((uploaded, dirty)) => format!("staged=yes uploaded={uploaded} dirty={dirty}"),
+        None => "staged=no".into(),
+    };
+    format!(
+        "{}x{} f{} levels={} host_copy={} {staged} host_written={} title_fills={} {}",
+        u64::from(words[4]) | u64::from(words[5]) << 32,
+        words[6],
+        words[8],
+        words[7] >> 16,
+        crate::resource::host_made(this).is_some(),
+        crate::texture::host_wrote(this as usize),
+        crate::resource::title_fills(this),
+        memory_state(at as u64, bytes)
+    )
+}
+
+/// A view of the title's heap for the frame listing: a texture with its
+/// state ([`texture_state`]; a placed one that has no resource yet with
+/// its memory alone), anything else in a few words.
+#[cfg(feature = "diagnostics")]
+fn view_state(view: Option<&View>) -> String {
+    match view {
+        None => "no view".into(),
+        Some(View::Placed(false, r, d)) if r[0] != 1 => {
+            let address = u64::from(d[10]) | u64::from(d[11]) << 32;
+            let state = match crate::resource::texture_at_made(address, r) {
+                Some(this) => texture_state(this),
+                None => format!(
+                    "{}x{} f{} levels={} resource=none {}",
+                    u64::from(r[4]) | u64::from(r[5]) << 32,
+                    r[6],
+                    r[8],
+                    r[7] >> 16,
+                    memory_state(address, crate::resource::placed_bytes(r).unwrap_or(0))
+                ),
+            };
+            format!("placed texture view_format={} {state}", d[0])
+        }
+        Some(View::Shader(r, d)) if crate::resource::texture_memory(*r as This).is_some() => {
+            format!(
+                "texture object {r:#x} view_format={} {}",
+                d.as_ref().map_or(0, |d| d[0]),
+                texture_state(*r as This)
+            )
+        }
+        Some(v) => format!("{v:?}").chars().take(80).collect(),
     }
 }
 
