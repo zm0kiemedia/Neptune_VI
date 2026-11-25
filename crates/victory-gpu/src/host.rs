@@ -4021,6 +4021,16 @@ impl Host {
     /// to be done once they have run comes back with the submission lock
     /// still held.
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        // D3D12 forbids executing the same command list concurrently with
+        // itself inside one `ExecuteCommandLists` call (real GPU drivers hang
+        // with DXGI_ERROR_DEVICE_HUNG), and a repeat call to `list.prelude()`
+        // resets and overwrites the prelude already queued for the first
+        // occurrence. Split at each duplicate so the earlier occurrence
+        // finishes on the GPU before the list and its prelude run again.
+        if let Some(split) = first_duplicate(runs) {
+            let _ = self.submit(&runs[..split], false);
+            return self.submit(&runs[split..], late);
+        }
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -6699,6 +6709,17 @@ fn pump() {
     }
 }
 
+/// Index of the first list in `runs` that already appeared earlier in `runs`
+/// (by pointer identity), or `None` if every list is distinct.
+fn first_duplicate(runs: &[&HostList]) -> Option<usize> {
+    if runs.len() <= 1 {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::with_capacity(runs.len());
+    runs.iter()
+        .position(|list| !seen.insert(std::ptr::from_ref(*list) as usize))
+}
+
 #[cfg(test)]
 mod trail {
     /// The trail keeps the newest things, and the report made when the
@@ -7159,5 +7180,70 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             }
             assert!(errors.is_empty(), "D3D12 debug errors: {errors:?}");
         }
+    }
+
+    /// Submitting the same `HostList` twice in one batch splits at the
+    /// duplicate so each occurrence completes on the GPU before the list and
+    /// its prelude run again — avoiding both prelude reset corruption and
+    /// hardware `DXGI_ERROR_DEVICE_HUNG` when the same command list appears
+    /// twice in one `ExecuteCommandLists` call.
+    #[test]
+    fn duplicate_list_in_submission_splits_and_executes_cleanly() {
+        use std::sync::atomic::Ordering;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+        let Some(host) = super::host() else {
+            return;
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 4,
+            Height: 4,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            ..Default::default()
+        };
+        let mut tex: Option<ID3D12Resource> = None;
+        // SAFETY: valid default texture creation on a live device.
+        unsafe {
+            host.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut tex,
+                )
+                .unwrap();
+        }
+        let copy = Arc::new(crate::resource::HostTexture::new(tex.unwrap(), 0));
+        const COPY_DEST: u32 = 0x400;
+        const PIXEL_SHADER_RESOURCE: u32 = 0x80;
+
+        let list_a = host.new_list().unwrap();
+        list_a.settle(&copy, COPY_DEST);
+        list_a.settle(&copy, PIXEL_SHADER_RESOURCE);
+        list_a.close();
+        let list_b = host.new_list().unwrap();
+        list_b.close();
+
+        assert_eq!(super::first_duplicate(&[]), None);
+        assert_eq!(super::first_duplicate(&[&list_a]), None);
+        assert_eq!(super::first_duplicate(&[&list_a, &list_b]), None);
+        assert_eq!(super::first_duplicate(&[&list_a, &list_a]), Some(1));
+        assert_eq!(super::first_duplicate(&[&list_a, &list_b, &list_a]), Some(2));
+
+        // Execute `[&list_a, &list_a]` end-to-end on the real/WARP adapter.
+        host.execute(&[&list_a, &list_a]);
+        assert_eq!(copy.state.load(Ordering::Relaxed), PIXEL_SHADER_RESOURCE);
     }
 }
