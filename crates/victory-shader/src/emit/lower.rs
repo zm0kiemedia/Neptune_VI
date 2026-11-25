@@ -7263,11 +7263,6 @@ impl<'a> Lower<'a> {
                     // this lane's bit of it. Exact where host lanes are
                     // the console's.
                     None if self.mask_data == MaskData::Console => {
-                        // Each host wave taken as a wave of its own has no
-                        // console lane numbers to pick the bits by.
-                        if self.local {
-                            return Err("a constant lane mask in a half-wave");
-                        }
                         let m = mask.ok_or(UNTRACKED)?;
                         let lo = self.i32_of(m).map_err(|_| UNTRACKED)?;
                         // wave64: the register after it holds lanes 32-63.
@@ -7281,6 +7276,16 @@ impl<'a> Lower<'a> {
                             Some(h) => Some(self.i32_of(h).map_err(|_| UNTRACKED)?),
                             None => None,
                         };
+                        // A literal mask is available to both host waves.
+                        // Their relabelled console lanes select their own
+                        // bits without exchanging any wave's values.
+                        if self.local
+                            && !(self.exchange.is_some()
+                                && self.s.m.int_value(lo).is_some()
+                                && hi.is_some_and(|h| self.s.m.int_value(h).is_some()))
+                        {
+                            return Err("a constant lane mask in a half-wave");
+                        }
                         self.cross_lane(false)?;
                         self.lane_bit(c, lo, hi)
                     }

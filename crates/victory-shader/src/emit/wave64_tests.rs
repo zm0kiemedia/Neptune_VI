@@ -369,6 +369,53 @@ fn on_the_card(shader: &HostShader, constants: [u32; 2]) -> Option<u32> {
     Some(out[0][0])
 }
 
+#[test]
+fn local_waves_select_their_console_bits_from_a_constant_mask() {
+    let words = [
+        0xD760_000E,
+        0x0001_0100, // v_readlane_b32 s14, v0, 0: require console lane numbering
+        0xBE8C_0380, // s_mov_b32 s12, 0
+        0xBE8D_03C1, // s_mov_b32 s13, -1
+        0xD501_0001,
+        0x0031_0280, // v_cndmask_b32 v1, 0, 1, s[12:13]
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0xE070_1000,
+        0x8002_0103, // buffer_store_dword v1, v3, s[8:11], 0 offen
+    ];
+    let native = native(&words);
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let shader = lower::with_local_waves_any(|| lowered(&native, &p, &HashSet::new()))
+        .expect("lower a constant mask on two host waves");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
+    }
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(vec![0; shader.user_data_dwords() as usize]))],
+                views: &[View::RawUav(64)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .expect("dispatch the constant mask");
+    assert_eq!(&out[0][..32], &[0; 32]);
+    assert_eq!(&out[0][32..], &[1; 32]);
+    eprintln!("ran on the hardware device: each half selected its own mask bits");
+}
+
 /// A 32-lane console wave. A register holds a lane mask on one path (the lanes below s0)
 /// and a number on the other, and is read as a number after the join, as the trace programs
 /// keep their lanes' masks and their node numbers on one stack
