@@ -8417,6 +8417,18 @@ impl Meter {
             );
             if crate::shadow::cards() {
                 let per_frame = |i: usize| card[i] as f64 / frames;
+                if crate::coalesce::gap_bytes() > 0 {
+                    let c = [0, 1, 2, 3].map(|i| crate::shadow::COALESCED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                    tracing::info!(
+                        "sends up to the card joined across gaps of {} KiB or less per frame (VICTORY_UM_COALESCE_KB): \
+                         {:.0} ranges to {:.0} ({:.2} MB to {:.2} MB), in copies with more than one range",
+                        crate::coalesce::gap_bytes() >> 10,
+                        c[0],
+                        c[1],
+                        c[2] / 1e6,
+                        c[3] / 1e6
+                    );
+                }
                 tracing::info!(
                     "host copies in the card's memory: {} copies {} MB, their bytes from before {} MB; per frame: \
                      {:.1} MB sent up in {:.0} ranges, {:.0} pieces compared on the card, {:.0} of them fetched \

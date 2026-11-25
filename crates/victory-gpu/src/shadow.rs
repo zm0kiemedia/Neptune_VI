@@ -241,6 +241,10 @@ static CARDED: Mutex<Vec<std::sync::Weak<Shadow>>> = Mutex::new(Vec::new());
 /// bytes; the waits for the card the fetches added and their microseconds.
 pub(crate) static CARD_STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
 
+/// (Neptune) Since the last frame line, of `VICTORY_UM_COALESCE_KB`: ranges and bytes of the
+/// sends up before and after joining across gaps (only copies that had more than one range).
+pub(crate) static COALESCED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
 pub(crate) fn card_stats() -> [u64; 10] {
@@ -475,7 +479,27 @@ pub(crate) fn card_dirty(sent_as: u64) -> (Vec<(Arc<Shadow>, Vec<(usize, usize)>
             .as_ref()
             .map(|c| {
                 let mut dirty = c.dirty.lock().unwrap_or_else(|e| e.into_inner());
-                let ranges = std::mem::take(&mut *dirty);
+                let mut ranges = std::mem::take(&mut *dirty);
+                // (Neptune) `VICTORY_UM_COALESCE_KB`: join ranges across small gaps, never over
+                // ranges shaders may be writing (`pending`: the card side may be newer there).
+                let gap = crate::coalesce::gap_bytes();
+                if gap > 0 && ranges.len() > 1 {
+                    ranges = joined(ranges);
+                    let before = (ranges.len() as u64, ranges.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>());
+                    let mut blocked: Vec<(usize, usize)> = shadow
+                        .pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .map(|&(a, e)| shadow.inside(a, e - a))
+                        .collect();
+                    blocked.sort_unstable();
+                    ranges = crate::coalesce::merge_gaps(&ranges, gap, &blocked);
+                    let after = (ranges.len() as u64, ranges.iter().map(|&(a, b)| (b - a) as u64).sum::<u64>());
+                    for (stat, n) in COALESCED.iter().zip([before.0, after.0, before.1, after.1]) {
+                        stat.fetch_add(n, Ordering::Relaxed);
+                    }
+                }
                 if relay() {
                     let mut sent = c.sent.lock().unwrap_or_else(|e| e.into_inner());
                     sent.retain(|s| s.2 > fetched);

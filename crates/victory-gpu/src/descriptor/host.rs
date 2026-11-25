@@ -273,9 +273,23 @@ impl Spans {
     }
 
     /// The first span that starts inside `[start, end)` past the first
-    /// [`HEAD`] bytes of it.
+    /// [`HEAD`] bytes of it (or all of it, if it is smaller).
     fn next_start(&self, start: u64, end: u64) -> Option<u64> {
-        self.spans.range((start.saturating_add(HEAD), 0)..(end, 0)).next().map(|(&(at, _), _)| at)
+        static OLD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // `VICTORY_STALE_HEAD_FIXED=1` restores the old fixed head.
+        let old = *OLD.get_or_init(|| std::env::var("VICTORY_STALE_HEAD_FIXED").is_ok_and(|v| v == "1"));
+        self.next_start_with(start, end, old)
+    }
+
+    /// A texture's head is at most its own size: tiny textures a few hundred bytes apart
+    /// are not each other's head.
+    fn next_start_with(&self, start: u64, end: u64, fixed_head: bool) -> Option<u64> {
+        let head = if fixed_head { HEAD } else { HEAD.min(end.saturating_sub(start)) };
+        let from = start.saturating_add(head);
+        if from >= end {
+            return None;
+        }
+        self.spans.range((from, 0)..(end, 0)).next().map(|(&(at, _), _)| at)
     }
 
     /// The slots that hold a view of the texture at `start`.
@@ -3649,6 +3663,23 @@ mod tests {
         assert_eq!(dimension(None), D3D12_UAV_DIMENSION_TEXTURE2D);
         // Multisampled UAVs need a cap; they stay 2D.
         assert_eq!(dimension(Some(6)), D3D12_UAV_DIMENSION_TEXTURE2D);
+    }
+
+    /// Tiny textures a few hundred bytes apart are not each other's head; big ones are as before.
+    #[test]
+    fn small_textures_head_is_their_own_size() {
+        let mut spans = Spans::default();
+        let d = [0u32; 14];
+        spans.note(1, 0x1000, 0x1100, &d, true);
+        spans.note(2, 0x1100, 0x1200, &d, true);
+        assert_eq!(spans.next_start_with(0x1000, 0x1100, false), None);
+        assert_eq!(spans.next_start_with(0x1000, 0x1100, true), None);
+        // A 0x400 texture whose neighbour starts 0x100 in: inside its own head.
+        assert_eq!(spans.next_start_with(0x1000, 0x1400, false), None);
+        // A large texture: a start past 4 KiB counts, in both modes.
+        spans.note(3, 0x1_1000, 0x1_2000, &d, true);
+        assert_eq!(spans.next_start_with(0x1_0000, 0x1_5000, false), Some(0x1_1000));
+        assert_eq!(spans.next_start_with(0x1_0000, 0x1_5000, true), Some(0x1_1000));
     }
 
     /// What the texture code asks of the spans (levels on demand): where

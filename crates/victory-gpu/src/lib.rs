@@ -19,6 +19,7 @@
 mod agility;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+mod coalesce;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
