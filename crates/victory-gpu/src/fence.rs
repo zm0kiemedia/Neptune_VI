@@ -75,6 +75,34 @@ extern "system" fn query(this: This, iid: *const Iid, out: *mut This) -> HRESULT
 extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Fence>(this)
 }
+
+/// An owned COM reference to a [`Fence`], keeping it alive while a queue hold
+/// or late submission line still references it.
+#[cfg(windows)]
+pub(crate) struct FenceRef(This);
+
+// SAFETY: `Fence` uses an atomic value/refcount and a `Mutex` for waiters.
+#[cfg(windows)]
+unsafe impl Send for FenceRef {}
+
+#[cfg(windows)]
+impl FenceRef {
+    pub(crate) fn new(this: This) -> Self {
+        object::add_ref(this);
+        Self(this)
+    }
+
+    pub(crate) fn as_this(&self) -> This {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for FenceRef {
+    fn drop(&mut self) {
+        release(self.0);
+    }
+}
 pub(crate) extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
