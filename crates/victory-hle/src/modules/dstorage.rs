@@ -535,6 +535,8 @@ impl Lanes {
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 waiting,
+                shown_requests = SHOWN[0].swap(0, Ordering::Relaxed),
+                shown_mb = SHOWN[1].swap(0, Ordering::Relaxed) >> 20,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
             );
@@ -1054,7 +1056,10 @@ fn into_destination(
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
-        return fill(window.bytes()).map(drop);
+        let n = fill(window.bytes())?;
+        drop(window);
+        pages_written(pages, offset, n);
+        return Ok(());
     }
     let mut data = vec![0; len];
     let n = fill(&mut data)?;
@@ -1074,6 +1079,7 @@ fn into_destination(
         written = super::xmem::write_physical(pages, offset, &data[..n]);
     }
     if written {
+        pages_written(pages, offset, n);
         if tries > 0 {
             tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
         }
@@ -1092,6 +1098,34 @@ fn into_destination(
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)
+    }
+}
+
+/// Requests whose destination pages were mapped at title addresses when
+/// written, and the bytes at those addresses, since the last debug summary
+/// ([`pages_written`]).
+static SHOWN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Bytes `[offset, offset + len)` of physical pages were written through a
+/// view of our own: where the title has those pages mapped, the GPU side is
+/// told, as of a write through the kernel. Neither its guards nor its
+/// textures picked by index see a write through another view, so a texture
+/// the title maps first and streams into afterwards kept what its host copy
+/// took before (nothing yet, or the mip it replaced) until something else
+/// made it due. `VICTORY_DSTORAGE_SHOWN=0`: not told, as before.
+fn pages_written(pages: &[usize], offset: usize, len: usize) {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_DSTORAGE_SHOWN").is_none_or(|v| v != "0")) {
+        return;
+    }
+    let runs = super::xmem::shown_at(pages, offset, len);
+    if runs.is_empty() {
+        return;
+    }
+    SHOWN[0].fetch_add(1, Ordering::Relaxed);
+    for (at, bytes) in runs {
+        SHOWN[1].fetch_add(bytes as u64, Ordering::Relaxed);
+        victory_gpu::kernel_will_write(at, bytes);
     }
 }
 

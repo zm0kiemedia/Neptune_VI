@@ -370,6 +370,28 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// Where each mapped page shows, by its section and index: the title
+    /// addresses of the pages of views that show it ([`shown_at`]).
+    shown: HashMap<(usize, usize), Vec<usize>>,
+}
+
+impl Physical {
+    /// Notes in `shown` that `[base, base + len)` shows `slice` and the
+    /// slices after it (`add`), or no longer does.
+    fn note_shown(&mut self, base: usize, len: usize, slice: &Slice, add: bool) {
+        let section = Arc::as_ptr(&slice.section) as usize;
+        for k in 0..len.div_ceil(PAGE) {
+            let (key, at) = ((section, slice.index + k), base + k * PAGE);
+            if add {
+                self.shown.entry(key).or_default().push(at);
+            } else if let Some(at_all) = self.shown.get_mut(&key) {
+                at_all.retain(|&a| a != at);
+                if at_all.is_empty() {
+                    self.shown.remove(&key);
+                }
+            }
+        }
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -563,6 +585,42 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     true
 }
 
+/// The title addresses that show bytes `[offset, offset + len)` of `pages`
+/// now, as runs of whole pages (address, bytes): a write to the pages
+/// through a view of our own ([`page_window`], [`write_physical`]) lands
+/// there too, unseen by what watches those addresses (the GPU side's
+/// guards and its textures picked by index). Empty if none is mapped.
+pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
+    let Some(end) = offset.checked_add(len) else {
+        return Vec::new();
+    };
+    let Some(pages) = pages.get(offset / PAGE..end.div_ceil(PAGE)) else {
+        return Vec::new();
+    };
+    let physical = physical();
+    if physical.shown.is_empty() {
+        return Vec::new();
+    }
+    let mut at: Vec<usize> = pages
+        .iter()
+        .filter_map(|page| physical.pages.get(page))
+        .filter_map(|s| physical.shown.get(&(Arc::as_ptr(&s.section) as usize, s.index)))
+        .flatten()
+        .copied()
+        .collect();
+    drop(physical);
+    at.sort_unstable();
+    at.dedup();
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for a in at {
+        match runs.last_mut() {
+            Some((start, bytes)) if *start + *bytes == a => *bytes += PAGE,
+            _ => runs.push((a, PAGE)),
+        }
+    }
+    runs
+}
+
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
 /// until dropped: DirectStorage decodes into it instead of a buffer it
 /// would then copy.
@@ -746,6 +804,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    physical.note_shown(base, len, &slice, true);
     physical.views.insert(base, (len, slice));
     true
 }
@@ -824,6 +883,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        physical.note_shown(at, size, &slice, false);
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
@@ -1304,6 +1364,42 @@ mod tests {
         );
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    #[test]
+    fn pages_say_where_they_are_mapped() {
+        let pages = allocate(3);
+        let reserve = || {
+            let flags = MEM_RESERVE | PAGES_64K;
+            let at = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, flags, 0, PAGE_READWRITE);
+            assert!(!at.is_null());
+            at
+        };
+        let (a, b) = (reserve(), reserve());
+        assert!(shown_at(&pages, 0, 3 * PAGE).is_empty(), "mapped nowhere");
+        // All three at `a`; the last two at `b`, from its second page on.
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        let second = b.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(second, 2, pages[1..].as_ptr()), second);
+        let (a, second) = (a as usize, second as usize);
+        assert_eq!(shown_at(&pages, 0, PAGE), vec![(a, PAGE)]);
+        assert_eq!(
+            shown_at(&pages, PAGE + 1, PAGE),
+            vec![(a + PAGE, 2 * PAGE), (second, 2 * PAGE)]
+        );
+        // A page unmapped in the middle of a view: the rest still shows.
+        let middle = (a + PAGE) as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(middle, 1, std::ptr::null()), middle);
+        assert_eq!(
+            shown_at(&pages, 0, 3 * PAGE),
+            vec![(a, PAGE), (a + 2 * PAGE, PAGE), (second, 2 * PAGE)]
+        );
+        for (at, n) in [(a, 3), (second, 2)] {
+            let at = at as *mut c_void;
+            assert_eq!(XMemMapPhysicalPages(at, n, std::ptr::null()), at);
+        }
+        assert!(shown_at(&pages, 0, 3 * PAGE).is_empty());
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     #[test]
