@@ -210,7 +210,7 @@ impl Tables {
             })
             .collect();
         let bc7 = (0..DICTIONARY)
-            .map(|_| {
+            .map(|i| {
                 let mut ep = Bc7Ep {
                     ctrl: r.u16(),
                     ..Default::default()
@@ -222,10 +222,13 @@ impl Tables {
                     bits: [r.u8(), r.u8()],
                     ..Default::default()
                 };
-                // Unused: the widths again in all entries but the first.
-                r.u16();
-                // Only 15 slots for set 1, which no entry uses (0 bits).
-                for v in &mut ix.ix.as_flattened_mut()[..31] {
+                // Unused: the widths again in all entries but the first; entry 0
+                // stores all 32 indices directly after the 2 width bytes.
+                if i > 0 {
+                    r.u16();
+                }
+                let count = if i == 0 { 32 } else { 31 };
+                for v in &mut ix.ix.as_flattened_mut()[..count] {
                     *v = r.u16() as i16;
                 }
                 (ep, ix)
