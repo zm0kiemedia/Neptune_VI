@@ -190,6 +190,44 @@ static HOT_LEFT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::ne
 /// pages they walked, the written pages they found.
 static COUNTS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
+/// (Neptune) `VICTORY_UM_WATCH=1` (default off): kernel askings merge ranges up to 64 MiB apart
+/// (unless `VICTORY_ASK_WIDE_MB` / `VICTORY_ASK_QUIET_GAP_MB` say otherwise). Walking a clean
+/// 4 KiB page costs ~2 ns (spike: 4-5 ms for 8 GB), a call 30-70 us, so merging pays up to
+/// ~100 MB of gap. Only ranges some host copy refreshes are ever asked about, and what is not
+/// asked keeps its kernel bits (they are cleared only by our own RESET), so nothing is lost.
+pub(crate) fn um_watch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_UM_WATCH").is_some_and(|v| v == "1"))
+}
+
+/// Since the last [`asking_line`]: `GetWriteWatch` calls, bytes they covered, nanoseconds in them.
+static WW: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Notes one `GetWriteWatch` call over `bytes`, begun at `started`.
+fn ww_note(bytes: usize, started: std::time::Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    WW[0].fetch_add(1, Relaxed);
+    WW[1].fetch_add(bytes as u64, Relaxed);
+    WW[2].fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+}
+
+/// (Neptune) For the ram line: per frame since the last such line, kernel askings of
+/// `GetWriteWatch`, MB they covered, ms in them (with `VICTORY_UM_WATCH` on or off).
+pub(crate) fn asking_line() {
+    use std::sync::atomic::Ordering::Relaxed;
+    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = crate::queue::presented();
+    let frames = now.wrapping_sub(LAST.swap(now, Relaxed)).clamp(1, 1 << 20) as f64;
+    let w = [0, 1, 2].map(|i| WW[i].swap(0, Relaxed) as f64 / frames);
+    tracing::info!(
+        "write watch per frame (VICTORY_UM_WATCH={}): {:.1} GetWriteWatch calls, {:.1} MB queried, {:.2} ms",
+        um_watch() as u8,
+        w[0],
+        w[1] / 1048576.0,
+        w[2] / 1e6
+    );
+}
+
 fn count(which: usize, n: u64) {
     COUNTS[which].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
 }
@@ -406,7 +444,9 @@ fn ahead_limits() -> (usize, usize) {
     let mb = *WIDE.get_or_init(|| {
         std::env::var("VICTORY_ASK_WIDE_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(0).min(16384)
     });
-    if mb == 0 {
+    if mb == 0 && um_watch() {
+        ((64 << 20) / PAGE, AHEAD_MAX)
+    } else if mb == 0 {
         (AHEAD_GAP, AHEAD_MAX)
     } else {
         ((mb << 20) / PAGE, ((mb.max(1024)) << 20) / PAGE)
@@ -572,7 +612,7 @@ fn quiet_frames() -> u64 {
 /// clean page walked is 4 nanoseconds, a call that resets pages some 50 microseconds).
 fn quiet_gap() -> usize {
     static GAP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *GAP.get_or_init(|| std::env::var("VICTORY_ASK_QUIET_GAP_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(32))
+    *GAP.get_or_init(|| std::env::var("VICTORY_ASK_QUIET_GAP_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(if um_watch() { 64 } else { 32 }))
 }
 
 /// Journal pages to a block of [`quiet_frames`].
@@ -887,10 +927,12 @@ pub(crate) fn ours_flush() {
                 found.resize(count, 0);
             }
             let mut granularity = 0;
+            let started = std::time::Instant::now();
             // SAFETY: the answer buffer holds `count` entries.
             let failed = unsafe {
                 GetWriteWatch(WRITE_WATCH_FLAG_RESET, first as *const _, last - first, found.as_mut_ptr().cast(), &mut count, &mut granularity)
             } != 0;
+            ww_note(last - first, started);
             COUNTS[5].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if failed {
                 // Not all one reservation: each on its own, as before.
@@ -1031,7 +1073,6 @@ fn ask_kernel_found(j: &mut Journal, first: usize, last: usize) -> Option<usize>
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
     let mut granularity = 0;
-    #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // (Neptune) View memory the guards already hold cannot be write-watched, and a range that
     // starts in it fails as a whole: no asking (fxceless/victory-fork 9376fd6).
@@ -1050,6 +1091,7 @@ fn ask_kernel_found(j: &mut Journal, first: usize, last: usize) -> Option<usize>
     if failed {
         return None;
     }
+    ww_note((last - first) * PAGE, started);
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
@@ -1113,7 +1155,6 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             found.resize(count, 0);
         }
         let mut granularity = 0;
-        #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         // SAFETY: the answer buffer holds `count` entries.
         let failed = unsafe {
@@ -1126,6 +1167,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
                 &mut granularity,
             )
         } != 0;
+        if !failed {
+            ww_note((last - first) * PAGE, started);
+        }
         let guarded = if failed {
             count = 0;
             if !guarded {

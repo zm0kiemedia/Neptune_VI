@@ -2119,6 +2119,8 @@ impl State {
             } else {
                 None
             };
+            // Before the fingerprint: a write between the two is looked at again.
+            let epoch = memory.and_then(|_| crate::texture::staged_epoch(resource));
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
@@ -2131,7 +2133,7 @@ impl State {
             host.texture_slot_done(index, write, again);
             // Whole and uploaded: looked at again (`texture_slots_rechecked`).
             if let Some((at, len)) = memory {
-                host.texture_slot_recheck(index, frame, (at, len), crate::texture::fingerprint(at, len));
+                host.texture_slot_recheck(index, frame, (at, len), crate::texture::fingerprint(at, len), epoch);
             }
         }
         catching_up(began.elapsed().saturating_sub(plain));

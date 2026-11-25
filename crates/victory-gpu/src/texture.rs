@@ -87,6 +87,8 @@ struct Last {
     /// ([`Staging::unseen_write`]): it is hashed at every check until this
     /// frame.
     unguarded: u64,
+    /// (`VICTORY_UM_TEXLOOK`) The remap epoch of its pages at the last look.
+    remap: u64,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -1080,6 +1082,10 @@ impl Staging {
         // that only changed every eighth frame, one old picture after
         // another on the screen).
         let mut unseen = false;
+        let mut journal_clean = false;
+        // (`VICTORY_UM_TEXLOOK`) The remap epoch of the pages, taken before any read of them.
+        let remap = if crate::epoch::on() { crate::epoch::max(start, size) } else { 0 };
+        let remapped = crate::epoch::on() && remap != last.remap;
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
         {
@@ -1089,7 +1095,9 @@ impl Staging {
             // frame of the first room.
             static HASH_EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
             let hash_every = *HASH_EVERY.get_or_init(|| {
-                std::env::var("VICTORY_TEXTURE_HASH_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(8).max(1)
+                // With epochs the hash is the safety net only.
+                let dflt = if crate::epoch::on() { 256 } else { 8 };
+                std::env::var("VICTORY_TEXTURE_HASH_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(dflt).max(1)
             });
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
             last.asked = now;
@@ -1099,10 +1107,18 @@ impl Staging {
             // planes of a movie), through a view of its own.
             let desc = &self.layout.desc;
             let film = desc.swizzle.0 == 0 && desc.mips == 1;
-            if unwritten && !turn && !film && frame >= last.unguarded {
+            journal_clean = unwritten && !remapped;
+            if unwritten && !turn && !film && frame >= last.unguarded && !remapped {
+                if crate::epoch::on() {
+                    crate::epoch::LOOKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 return 0;
             }
             unseen = unwritten;
+        }
+        last.remap = remap;
+        if crate::epoch::on() {
+            crate::epoch::LOOKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // From here on the texture's memory may be read in place. Held until
         // that read is done: the runtime changes what title memory shows
@@ -1131,10 +1147,22 @@ impl Staging {
             // unmapped pages is slow, and nothing tells us when pages
             // arrive): a mip that streams in shows up to 30 frames late.
             let frame = crate::frame::current();
-            if last.partial.is_some_and(|at| frame < at + 30) {
+            // (`VICTORY_UM_TEXLOOK`) Pages that arrive are mapped or written through the runtime,
+            // which bump their epoch, and writes of the title are in the journal: while neither
+            // advanced it is read at most every 256 frames.
+            let wait = match (crate::epoch::on(), journal_clean, remapped) {
+                (true, true, _) => 256,
+                (true, false, true) => 0,
+                _ => 30,
+            };
+            if last.partial.is_some_and(|at| frame < at + wait) {
+                if crate::epoch::on() {
+                    crate::epoch::LOOKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 return 0;
             }
             last.partial = Some(frame);
+            last.remap = remap;
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
             let changed = with_read(size, |read| {
@@ -1250,12 +1278,16 @@ impl Staging {
         } else {
             UNLOCKED[1].fetch_add(1, Relaxed);
             last.asked = 0;
+            last.remap = u64::MAX;
             0
         }
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        if crate::epoch::on() {
+            crate::epoch::LOOKS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
         // Levels on demand: which levels are the title's is judged here,
         // once, for what the staging buffer holds from now on. The step
@@ -1340,6 +1372,33 @@ pub(crate) fn staged_memory(resource: This) -> Option<(u64, u64)> {
     // behind them is another texture's, and its changes are not this one's.
     let len = if s.on_demand { s.held_bytes() } else { s.size };
     Some((s.memory as u64, len as u64))
+}
+
+/// (`VICTORY_UM_TEXLOOK`) What says the memory `[at, at + len)` was written or remapped: the
+/// highest journal stamp of its pages and the highest remap epoch. `None` where the memory is
+/// neither write-watched nor guarded: nothing then tells of writes, and it is read at each look.
+pub(crate) fn look_epoch(at: u64, len: u64) -> Option<[u64; 2]> {
+    if !crate::epoch::on() {
+        return None;
+    }
+    let (start, end) = (at as usize, at.saturating_add(len) as usize);
+    // Remaps first: one between the two reads is seen by the next look.
+    let remap = crate::epoch::max(start, len as usize);
+    let (_, pages) = crate::watch::writes(start, end, true)?;
+    Some([pages.iter().map(|&(_, w)| w).max().unwrap_or(0), remap])
+}
+
+/// [`look_epoch`] of a staged texture; `None` for one made level by level (which levels are the
+/// title's is judged by views, not by memory: its looks read).
+pub(crate) fn staged_epoch(resource: This) -> Option<[u64; 2]> {
+    let s = {
+        let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+        map.as_ref()?.get(&(resource as usize))?.clone()
+    };
+    if s.on_demand {
+        return None;
+    }
+    look_epoch(s.memory as u64, s.size as u64)
 }
 
 /// A fingerprint of the title memory `[at, at + len)`, never 0: of all of

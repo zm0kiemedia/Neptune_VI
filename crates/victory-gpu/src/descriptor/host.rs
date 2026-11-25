@@ -385,6 +385,7 @@ const PAGE_WRITE_AFTER: u64 = 2;
 /// ranges; locks one mutex and calls nothing.
 pub(crate) fn page_written(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
+    crate::epoch::bump(at, len);
     /// Ranges kept until a pass takes them.
     const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
@@ -466,6 +467,7 @@ fn stale_out() -> bool {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
+    crate::epoch::bump(at, len);
     /// Ranges kept until a pass takes them.
     /// (A world's first minutes note tens of thousands between two passes:
     /// 131,072 were dropped in one run at the 32,768 there were.)
@@ -554,6 +556,9 @@ pub(crate) struct Recheck {
     pub(crate) looks: u8,
     /// The frame of the upload.
     pub(crate) uploaded: u64,
+    /// (`VICTORY_UM_TEXLOOK`) Journal stamp and remap epoch of its pages at the upload
+    /// (`crate::texture::look_epoch`); `None`: no epoch, every look reads the memory.
+    pub(crate) epoch: Option<[u64; 2]>,
 }
 
 /// Frames after a whole upload of a texture picked by index at which its
@@ -600,10 +605,10 @@ impl TextureQueue {
     /// Slot `index` was uploaded whole in `frame` from memory `at`, whose
     /// fingerprint is `print`: looked at again ([`RECHECK_FRAMES`]), unless
     /// it was written again meanwhile and waits in the queue.
-    fn recheck(&mut self, index: u32, frame: u64, at: (u64, u64), print: u64) {
+    fn recheck(&mut self, index: u32, frame: u64, at: (u64, u64), print: u64, epoch: Option<[u64; 2]>) {
         if !self.slots.contains_key(&index) {
             let due = frame + RECHECK_FRAMES[0];
-            self.rechecks.insert(index, Recheck { due, at, print, looks: 0, uploaded: frame });
+            self.rechecks.insert(index, Recheck { due, at, print, looks: 0, uploaded: frame, epoch });
         }
     }
 
@@ -1283,9 +1288,9 @@ impl HostHeap {
     }
 
     /// Title slot `index` was uploaded whole: see [`TextureQueue::recheck`].
-    pub(crate) fn texture_slot_recheck(&self, index: u32, frame: u64, at: (u64, u64), print: u64) {
+    pub(crate) fn texture_slot_recheck(&self, index: u32, frame: u64, at: (u64, u64), print: u64, epoch: Option<[u64; 2]>) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
-        textures.recheck(index, frame, at, print);
+        textures.recheck(index, frame, at, print, epoch);
     }
 
     /// Looks again at slots uploaded whole: the title writes a texture's
@@ -1308,7 +1313,20 @@ impl HostHeap {
             if began.elapsed() > SPAN {
                 break;
             }
-            let changed = crate::texture::fingerprint(seen.at.0, seen.at.1) != seen.print;
+            // (`VICTORY_UM_TEXLOOK`) No page of it written or remapped since the upload: not
+            // read, as unchanged. The last look of the schedule always reads (a safety net).
+            let last_look = usize::from(seen.looks) + 2 >= RECHECK_FRAMES.len();
+            let epoch_same = !last_look
+                && seen.epoch.is_some_and(|e| crate::texture::look_epoch(seen.at.0, seen.at.1) == Some(e));
+            if epoch_same {
+                crate::epoch::LOOKS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                crate::epoch::LOOKS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let changed = !epoch_same && crate::texture::fingerprint(seen.at.0, seen.at.1) != seen.print;
+            if changed {
+                crate::epoch::LOOKS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             found[usize::from(changed)] += 1;
             if changed {
                 static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3814,10 +3832,10 @@ mod tests {
         let at = (0x1000, 64);
         q.written(7, 1, 1, false);
         let write = q.due(1, 1)[0].1;
-        q.recheck(7, 1, at, 5);
+        q.recheck(7, 1, at, 5, None);
         assert!(q.rechecks_due(1000, 9).is_empty(), "it waits in the queue");
         q.done(7, write);
-        q.recheck(7, 1, at, 5);
+        q.recheck(7, 1, at, 5, None);
         assert_eq!(q.census(1000)[0], 0, "no slot of the queue");
         let mut frame = 1;
         for wait in RECHECK_FRAMES {
@@ -3828,14 +3846,14 @@ mod tests {
             q.rechecked(7, &due[0].1, false, frame);
         }
         assert!(q.rechecks_due(u64::MAX, 9).is_empty(), "the looks are over");
-        q.recheck(7, frame, at, 5);
+        q.recheck(7, frame, at, 5, None);
         let due = q.rechecks_due(u64::MAX, 9);
         q.rechecked(7, &due[0].1, true, frame + 4);
         assert_eq!(q.due(frame + 4, 9)[0].0, 7);
         assert!(q.rechecks_due(u64::MAX, 9).is_empty());
         // A draw makes the host slot anew: the slot is due although a look
         // at it was still to come.
-        q.recheck(8, 1, at, 5);
+        q.recheck(8, 1, at, 5, None);
         let seen = q.rechecks_due(u64::MAX, 9);
         q.written(8, 2, 2, true);
         assert!(q.due(2, 9).iter().any(|d| d.0 == 8));

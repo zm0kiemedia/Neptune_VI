@@ -303,6 +303,7 @@ pub(crate) fn log() {
         mb(victory_core::heapcount::RUST_HEAP[0].load(Relaxed)),
         mb(crate::watch::NOTIFIED.swap(0, Relaxed)),
     );
+    crate::watch::asking_line();
     tracing::info!(
         "ram line: process working set {} MB, private {} MB; PC free {} MB, free commit {} MB; \
          title memory host copies {} alive {} MB (windows outside buffers {} {} MB; snapshot buffers kept {} reserving {} MB); \
