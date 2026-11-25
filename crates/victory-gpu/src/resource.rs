@@ -1175,6 +1175,9 @@ pub(crate) struct HostTexture {
     /// levels have been given. Its `bytes` are 0: what it holds of the card
     /// is counted there.
     pub(crate) tiled: Option<crate::tiles::Tiled>,
+    /// (Neptune) Where it lies in a heap of textures (`crate::placement`), if it is not a
+    /// committed resource of its own: given back when it goes.
+    placement: Option<crate::placement::Placement>,
 }
 
 /// What a title texture has on the host: its host copy and, for a depth
@@ -1404,7 +1407,18 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         let texture = match texture {
             Some(texture) => Some(texture),
-            None => host_texture(&r.desc, r.host.state, clear),
+            None => {
+                // (Neptune) In a heap of textures (`crate::placement`) if the title fills it
+                // and its upload can read it: that upload writes every level (zeros where
+                // title memory is not there), so what the range held before is never seen.
+                // A texture that is never uploaded (no console layout, an XOR mode) would
+                // show its range's last picture: it stays a resource of its own.
+                let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+                PLACE_OK.set(fills(&r.desc) && readable);
+                let made = host_texture(&r.desc, r.host.state, clear);
+                PLACE_OK.set(false);
+                made
+            }
         };
         let Some(texture) = texture else {
             r.host.refused.store(true, Relaxed);
@@ -1422,12 +1436,17 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 "depth texture with unordered access"
             );
         }
-        let state = crate::host::legal_state(&texture, crate::host::texture_state(r.host.state));
+        let state = match POOLED_STATE.take() {
+            // (Neptune) From the pool: where its last holder left it.
+            Some(left) if tiled.is_none() => left,
+            _ => crate::host::legal_state(&texture, crate::host::texture_state(r.host.state)),
+        };
         let mut host = match tiled {
             Some(tiled) => HostTexture::new_tiled(texture, state, tiled),
             None => HostTexture::new(texture, state),
         };
         host.filled = fills(&r.desc);
+        host.placement = PLACED.take();
         if host.filled {
             KINDS[0].fetch_add(1, Relaxed);
             KINDS[1].fetch_add(host.bytes, Relaxed);
@@ -1500,6 +1519,9 @@ pub(crate) fn room() -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
+            // (Neptune) What the heaps of textures hold free is the card's memory in the
+            // system's count, and not in use.
+            let used = used.saturating_sub(crate::placement::free_bytes());
             used + crate::shadow::card_room_kept() + targets_room_kept() < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
@@ -2332,6 +2354,171 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
     }
 }
 
+/// (Neptune) Whether host textures of textures the title fills are placed in heaps made
+/// ahead (`crate::placement`; `VICTORY_TEXTURE_HEAPS=0`: each a committed resource of its
+/// own, as before).
+///
+/// A host copy was a committed resource: 126,000 created and 98,000 destroyed in the 750 s
+/// of run ve145, thousands a second while a new part of the world streamed in (the frames of
+/// 200 to 640 ms on the way into a new area). Marvisak measured 300 textures of a new shot
+/// (430 MB): committed 255 ms; one heap 32 ms, then placed 3 ms.
+#[cfg(windows)]
+fn texture_heaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HEAPS").is_none_or(|v| v != "0"))
+}
+
+/// (Neptune) Since the start: host textures placed in a heap, and placements the host refused.
+#[cfg(windows)]
+pub(crate) static TEXTURES_PLACED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(windows)]
+thread_local! {
+    /// (Neptune) `hosted` allows the texture it is about to make to be placed in a heap.
+    static PLACE_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// (Neptune) Where [`host_texture_as`] just placed the texture it returned.
+    static PLACED: std::cell::Cell<Option<crate::placement::Placement>> = const { std::cell::Cell::new(None) };
+}
+
+/// (Neptune) What says two plain host textures are alike: dimension, width, height, depth or
+/// layers, levels, format, samples.
+#[cfg(windows)]
+type PoolKey = (u32, u64, u32, u16, u16, u32, u32);
+
+/// (Neptune) Host textures of textures the title fills that were let go, by description, each
+/// with the state it was left in and its bytes; then the keys in the order they were put in,
+/// and the bytes held.
+///
+/// A host copy was a committed resource of its own: 126,000 of them were created and 98,000
+/// destroyed in the 750 s of run ve145 (170 and 130 a second, thousands a second while a
+/// new part of the world streamed in), each a piece of the card's memory asked of and given
+/// back to the system, on the threads that record the frame and on the one that submits it:
+/// the frames of 200 to 640 ms on the way into a new area. The title's textures come in
+/// few shapes, so the next one of a shape takes the last one let go.
+/// `VICTORY_TEXTURE_POOL_MB` (0: none are kept, the default; it was 768 for one run) bounds what is held; the
+/// oldest go first, and all of them when the card has no room ([`room_lately`]).
+/// A texture from the pool holds its last holder's picture until the new holder's first
+/// upload, which every use records ahead of itself (`crate::texture::upload`).
+#[cfg(windows)]
+#[allow(clippy::type_complexity)]
+static TEXTURE_POOL: std::sync::Mutex<
+    Option<(
+        std::collections::HashMap<PoolKey, Vec<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64)>>,
+        std::collections::VecDeque<PoolKey>,
+        u64,
+    )>,
+> = std::sync::Mutex::new(None);
+
+/// (Neptune) Since the start: host textures taken from the pool, made new where one could
+/// have been taken, put into the pool, and let go from it (the oldest, or for want of room).
+#[cfg(windows)]
+pub(crate) static TEXTURE_POOLED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(windows)]
+thread_local! {
+    /// (Neptune) The state of the texture [`host_texture_as`] just took from the pool.
+    static POOLED_STATE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// (Neptune) The most bytes the pool holds (`VICTORY_TEXTURE_POOL_MB`; 0, the default: no pool).
+#[cfg(windows)]
+fn texture_pool_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        // Off unless asked for: a texture from the pool shows its last holder's picture until
+        // its own first upload, and where that upload waits (memory not all there yet) the
+        // picture stays (run ve146: foliage on walls, trees lit green in the dark).
+        std::env::var("VICTORY_TEXTURE_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0) << 20
+    })
+}
+
+/// (Neptune) The bytes the pool holds now, for the log.
+#[cfg(windows)]
+pub(crate) fn texture_pool_bytes() -> u64 {
+    TEXTURE_POOL.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |p| p.2)
+}
+
+#[cfg(windows)]
+fn pool_take(key: &PoolKey) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+    let mut pool = TEXTURE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let (by_key, order, held) = pool.as_mut()?;
+    let of_key = by_key.get_mut(key)?;
+    let (texture, state, bytes) = of_key.pop()?;
+    if of_key.is_empty() {
+        by_key.remove(key);
+    }
+    if let Some(at) = order.iter().position(|k| k == key) {
+        order.remove(at);
+    }
+    *held = held.saturating_sub(bytes);
+    TEXTURE_POOLED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Some((texture, state))
+}
+
+/// (Neptune) `texture`, in state `state`, is let go by its only holder: into the pool if it
+/// is a plain texture nothing else names and the card has room.
+#[cfg(windows)]
+fn pool_put(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32, bytes: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::Win32::Graphics::Direct3D12::*;
+    let most = texture_pool_most();
+    if most == 0 || bytes == 0 || bytes > most / 4 {
+        return;
+    }
+    // A slot or a list that still views it would show the next holder's picture.
+    if crate::host::references(texture) != 1 {
+        return;
+    }
+    // SAFETY: a live resource.
+    let d = unsafe { texture.GetDesc() };
+    if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER || d.Flags != D3D12_RESOURCE_FLAG_NONE {
+        return;
+    }
+    let mut gone = Vec::new();
+    // Asked before the pool's lock is taken: it asks the system and other tables.
+    let room = room_lately();
+    {
+        let mut pool = TEXTURE_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        let (by_key, order, held) = pool.get_or_insert_with(Default::default);
+        if !room {
+            // The card is at its line: what the pool holds goes back, and this one with it.
+            gone.extend(by_key.drain().flat_map(|(_, v)| v));
+            order.clear();
+            *held = 0;
+        } else {
+            let key: PoolKey = (
+                d.Dimension.0 as u32,
+                d.Width,
+                d.Height,
+                d.DepthOrArraySize,
+                d.MipLevels,
+                d.Format.0 as u32,
+                d.SampleDesc.Count.max(1),
+            );
+            by_key.entry(key).or_default().push((texture.clone(), state, bytes));
+            order.push_back(key);
+            *held += bytes;
+            TEXTURE_POOLED[2].fetch_add(1, Relaxed);
+            while *held > most {
+                let Some(oldest) = order.pop_front() else { break };
+                if let Some(of_key) = by_key.get_mut(&oldest) {
+                    if !of_key.is_empty() {
+                        let out = of_key.remove(0);
+                        *held = held.saturating_sub(out.2);
+                        gone.push(out);
+                    }
+                    if of_key.is_empty() {
+                        by_key.remove(&oldest);
+                    }
+                }
+            }
+        }
+    }
+    TEXTURE_POOLED[3].fetch_add(gone.len() as u64, Relaxed);
+    // Released outside the lock.
+    drop(gone);
+}
+
 #[cfg(windows)]
 impl HostTexture {
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
@@ -2345,6 +2532,7 @@ impl HostTexture {
             bytes,
             filled: false,
             tiled: None,
+            placement: None,
         }
     }
 
@@ -2362,6 +2550,7 @@ impl HostTexture {
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
+            placement: None,
         }
     }
 }
@@ -2370,6 +2559,12 @@ impl HostTexture {
 impl Drop for HostTexture {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        if let Some(placement) = self.placement.take() {
+            // Its range is free again once nothing else holds the resource.
+            crate::placement::free(self.texture.clone(), placement);
+        } else if self.filled && self.tiled.is_none() {
+            pool_put(&self.texture, self.state.load(Relaxed), self.bytes);
+        }
         HOST_TEXTURES[0].fetch_sub(1, Relaxed);
         HOST_TEXTURES[1].fetch_sub(self.bytes, Relaxed);
         if self.filled {
@@ -2495,6 +2690,54 @@ fn host_texture_as(
         }
         value
     });
+    // (Neptune) A plain texture the title fills: one let go before, of the same description,
+    // if there is one ([`pool_take`]). It comes in the state it was left in.
+    POOLED_STATE.set(None);
+    let poolable = !reserved && clear.is_null() && d.flags == 0 && texture_pool_most() != 0;
+    if poolable {
+        let key = (d.dimension, d.width, d.height, d.depth_or_array_size, d.mip_levels, d.format, d.sample_count.max(1));
+        if let Some((texture, state)) = pool_take(&key) {
+            POOLED_STATE.set(Some(state));
+            return Some(texture);
+        }
+        TEXTURE_POOLED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    PLACED.set(None);
+    if !reserved && clear.is_null() && d.flags == 0 && PLACE_OK.get() && texture_heaps() {
+        // SAFETY: `ResourceDesc` has the host's layout (as the creations below take it).
+        let dd: &D3D12_RESOURCE_DESC = unsafe { &*(&raw const d).cast() };
+        if crate::placement::fits(&host.device, dd)
+            && let Some((heap, placement)) = crate::placement::place(&host.device, dd)
+        {
+            let mut texture: Option<ID3D12Resource> = None;
+            // SAFETY: a range of the heap that is this texture's alone; our out pointer.
+            let made = unsafe {
+                host.device.CreatePlacedResource(
+                    &heap,
+                    placement.offset(),
+                    dd,
+                    D3D12_RESOURCE_STATES(crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32),
+                    None,
+                    &mut texture,
+                )
+            };
+            match (made, texture) {
+                (Ok(()), Some(texture)) => {
+                    TEXTURES_PLACED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    crate::host::name(&texture, || {
+                        format!("texture {}x{} f{} in a heap", d.width, d.height, d.format)
+                    });
+                    PLACED.set(Some(placement));
+                    return Some(texture);
+                }
+                _ => {
+                    // Refused there: a resource of its own, as before.
+                    crate::placement::unplace(placement);
+                    TEXTURES_PLACED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()

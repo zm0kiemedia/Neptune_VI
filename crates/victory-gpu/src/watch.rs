@@ -128,6 +128,54 @@ fn guard_hot() -> u64 {
     *FRAMES.get_or_init(|| std::env::var("VICTORY_GUARD_HOT").ok().and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
+/// (Neptune, after avatarmanz/VIctory-7900XTX 7bc7c074) How long a block the title has just
+/// opened by a write is left open by those that take it (`VICTORY_GUARD_REST=<microseconds>`,
+/// 3,000 unless given; `0`: not at all, as before).
+///
+/// A refresh takes a block and makes it read-only while the title is still writing it: the
+/// next write faults, opens it, and the next refresh, a millisecond later, guards it again;
+/// each a change of protection behind the guards' one lock, where the recording threads
+/// stood a tenth of their time (run ve165: 40 of 400 samples a thread in the fault handler,
+/// 37 of them waiting for the lock). A block that rests counts as written at each asking,
+/// so nothing is missed; it is read-only at the first asking after its rest, which sees the
+/// title's later writes. Not a block shown in other views too: a write through this one
+/// would not open theirs.
+fn guard_rest() -> u64 {
+    static US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *US.get_or_init(|| std::env::var("VICTORY_GUARD_REST").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(3000))
+}
+
+/// Of a block, for [`guard_rest`]: when a write fault last opened it ([`now_us`]; 0: never).
+static REST: [std::sync::atomic::AtomicPtr<Part>; 1 << 16] =
+    [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 1 << 16];
+
+/// Microseconds since the first call, and never 0.
+fn now_us() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64 + 1
+}
+
+/// A write fault opened `block`, which no other view shows.
+fn rest_note(block: usize) {
+    if let Some(part) = part_of(&REST, block, true) {
+        part.0[block % PART].store(now_us(), std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Whether `block` was opened by a write fault within the last `rest` microseconds.
+fn resting(block: usize, rest: u64) -> bool {
+    let at = part_of(&REST, block, false).map_or(0, |part| part.0[block % PART].load(std::sync::atomic::Ordering::Acquire));
+    at != 0 && now_us().wrapping_sub(at) <= rest
+}
+
+/// Blocks found written and left open as they rest, since the last line in the log.
+static RESTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`RESTED`], taken.
+pub(crate) fn rested() -> u64 {
+    RESTED.swap(0, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Of a block, for [`guard_hot`]: the frame it was last found written in (40 bits), how
 /// many checks running found it so (16 bits), and whether it is left open since that frame.
 static HOT: [std::sync::atomic::AtomicPtr<Part>; 1 << 16] =
@@ -366,18 +414,52 @@ fn found_set(address: usize, now: u64) {
 /// With [`watch_4k`]: which 4 KiB pages (bit k: the k-th) of `page` were written after
 /// asking `at`, and `None` where that is not known, and the whole page is to be taken: never
 /// copied (`at == 0`), written without a 4 KiB answer, or nothing found.
-pub(crate) fn stale_mask(page: usize, at: u64) -> Option<u16> {
-    use std::sync::atomic::Ordering::Acquire;
-    if !watch_4k() || at == 0 {
+pub(crate) fn stale_mask(page: usize, at: u64, whole: bool) -> Option<u16> {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    if at == 0 {
+        STALE_WHY[if whole { 0 } else { 5 }].fetch_add(1, Relaxed);
+        return None;
+    }
+    if !watch_4k() {
         return None;
     }
     if part_of(&WHOLE, page, false).is_some_and(|p| p.0[page % PART].load(Acquire) > at) {
+        STALE_WHY[1].fetch_add(1, Relaxed);
         return None;
     }
     let sub = page * (PAGE / KERNEL_PAGE);
-    let part = part_of(&SUBS, sub, false)?;
+    let Some(part) = part_of(&SUBS, sub, false) else {
+        STALE_WHY[2].fetch_add(1, Relaxed);
+        return None;
+    };
     let stamps: [u64; PAGE / KERNEL_PAGE] = std::array::from_fn(|k| part.0[(sub + k) % PART].load(Acquire));
-    mask_of(&stamps, at)
+    let mask = mask_of(&stamps, at);
+    STALE_WHY[if mask.is_some() { 4 } else { 3 }].fetch_add(1, Relaxed);
+    mask
+}
+
+/// (Neptune) Stale pages since the last frame line, by what [`stale_mask`] said of them: never
+/// copied, written whole since, no table of 4 KiB pages, none of them newer, taken by them.
+/// The last: never noted copied because their range holds them in part.
+static STALE_WHY: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// [`STALE_WHY`], taken.
+pub(crate) fn stale_why_stats() -> [u64; 6] {
+    [0, 1, 2, 3, 4, 5].map(|i| STALE_WHY[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
+/// (Neptune) Pages noted written whole since the last frame line, by who said so: the
+/// copy-back through the title's view, a title write found beside it (by its 4 KiB page
+/// now), the copy-back through a view of ours, our own writes, the runtime's, the guards.
+static WHOLE_BY: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+fn whole_by(who: usize, pages: usize) {
+    WHOLE_BY[who].fetch_add(pages as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`WHOLE_BY`], taken.
+pub(crate) fn whole_by_stats() -> [u64; 6] {
+    [0, 1, 2, 3, 4, 5].map(|i| WHOLE_BY[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// The sub-pages stamped after `at`; `None` if there are none (the page's stamp then rests on
@@ -874,6 +956,7 @@ pub(crate) fn ours_after(at: usize, len: usize) -> Vec<(usize, u64, u64)> {
         unsafe { ResetWriteWatch(first as *const _, last - first) };
     }
     let now = next_asking();
+    whole_by(0, at.saturating_add(len).div_ceil(PAGE) - at / PAGE);
     (at / PAGE..at.saturating_add(len).div_ceil(PAGE)).map(|page| (page, written_set(page, now), now)).collect()
 }
 
@@ -952,7 +1035,9 @@ pub(crate) fn ours_flush() {
                         if now == 0 {
                             now = next_asking();
                         }
-                        written_set(at / PAGE, now);
+                        // (Neptune) The kernel names its 4 KiB page.
+                        whole_by(1, 1);
+                        found_set(at, now);
                     }
                 }
             }
@@ -976,6 +1061,7 @@ pub(crate) fn ours_through(at: usize, len: usize) -> Vec<(usize, u64, u64)> {
     let now = next_asking();
     let mut marks = Vec::new();
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
+        whole_by(2, 1);
         marks.push((page, written_set(page, now), now));
         for alias in crate::inplace::pages_of(page * PAGE) {
             if alias / PAGE != page {
@@ -1010,6 +1096,7 @@ pub(crate) fn wrote(at: usize, len: usize) {
     // again at every refresh, and a reason to settle flights
     // (fxceless/victory-fork#410).
     JOURNAL.write().unwrap_or_else(|e| e.into_inner()).ahead_asked = now;
+    whole_by(3, at.saturating_add(len).div_ceil(PAGE) - at / PAGE);
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         written_set(page, now);
     }
@@ -1037,6 +1124,7 @@ pub fn written_through_view(at: usize, len: usize) {
     for page in at / PAGE..at.saturating_add(len).div_ceil(PAGE) {
         written_set(page, now);
     }
+    whole_by(4, at.saturating_add(len).div_ceil(PAGE) - at / PAGE);
     NOTIFIED.fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -1196,6 +1284,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             found_set(at, now);
         }
         for page in guarded {
+            whole_by(5, 1);
             written_set(page, now);
         }
         Some((now, written_in(first, last)))
@@ -1313,6 +1402,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         return Some(Vec::new());
     }
     let hot = guard_hot();
+    let rest = guard_rest();
     let frame = crate::queue::presented();
     if !ask && first < last {
         // (Neptune) Clean blocks, blocks left open and blocks that are still not committed,
@@ -1324,7 +1414,10 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             if clean_all(block, block + 1) {
                 continue;
             }
-            if hot > 0 && left_open(block, frame, hot) {
+            if (hot > 0 && left_open(block, frame, hot)) || (rest > 0 && resting(block, rest)) {
+                if rest > 0 {
+                    RESTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
                 continue;
             }
@@ -1349,7 +1442,11 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let (known, all_clean) = {
         let g = guards_read();
         (
-            !ask && (g.protected.contains(&first) || g.absent.contains(&first) || (hot > 0 && left_open(first, frame, hot))),
+            !ask
+                && (g.protected.contains(&first)
+                    || g.absent.contains(&first)
+                    || (hot > 0 && left_open(first, frame, hot))
+                    || (rest > 0 && resting(first, rest))),
             g.clean.range(first..last).count() == last - first,
         )
     };
@@ -1404,6 +1501,9 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 clean_set(block, true);
             } else if hot > 0 && stays_open(&g, block, frame, hot) {
                 // (Neptune) Left open (`guard_hot`): the run of blocks to guard ends before it.
+            } else if rest > 0 && resting(block, rest) {
+                // (Neptune) It rests (`guard_rest`): written, and not guarded yet.
+                RESTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             } else {
                 run.get_or_insert(block);
                 continue;
@@ -1943,6 +2043,14 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             }
         }
     }
+    if guard_rest() > 0 {
+        // What is mapped there next does not rest.
+        for block in range.clone() {
+            if let Some(part) = part_of(&REST, block, false) {
+                part.0[block % PART].store(0, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
         g.absent.remove(&block);
@@ -1996,7 +2104,12 @@ fn install() {
             std::env::var("VICTORY_GUARD_OPEN_AHEAD").ok().and_then(|v| v.parse().ok()).unwrap_or(1).clamp(1, 64)
         });
         let block = at / BLOCK * BLOCK;
+        // (Before the opening, which forgets the other views.)
+        let alone = !g.aliased.contains(&(at / BLOCK));
         if open(&mut g, at, at + 1) {
+            if alone && guard_rest() > 0 {
+                rest_note(at / BLOCK);
+            }
             if ahead > 1 {
                 open(&mut g, block + BLOCK, block + ahead * BLOCK);
             }

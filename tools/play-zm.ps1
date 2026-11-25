@@ -72,6 +72,7 @@ $set = [ordered]@{
   VICTORY_LIST_POOL_MB        = '2048'
   VICTORY_WIDE_THREADS        = '12'
   VICTORY_UNDER_WRITES_MASKS_LEAST = '1'   # small changes go up in one pass per buffer
+  VICTORY_WATCH_4K            = '1'         # (upstream evening build) 4 KiB write tracking
   VICTORY_INDIRECT_RAW        = $(if ($RawIndirect) { '2' } else { '3' })  # indirect draws use the game's own arguments
   VICTORY_TEXTURE_HASH_EVERY  = '32'
   # added 2026-11-25 noon

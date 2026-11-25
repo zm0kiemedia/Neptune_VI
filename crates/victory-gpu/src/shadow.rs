@@ -35,6 +35,11 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// (Neptune, from avatarmanz/VIctory-7900XTX) Two ranges of title memory taken whole, the
+    /// last one and the longest, and the asking after which each was
+    /// ([`Shadow::copy_stale`]). A page a range holds in part cannot say so in `copied`.
+    /// Locked inside `copied`'s lock.
+    ranged: Mutex<[(usize, usize, u64); 2]>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -1474,6 +1479,7 @@ fn workers() -> &'static Workers {
         let n = if which == 1 { (n / 2).max(2) } else { n };
         for i in 0..n {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{which}-{i}")).spawn(move || {
+                crate::cores::keep_helper_on_fast_cores("victory-wide");
                 let workers = WORKERS[which].get().expect("made above");
                 loop {
                     let job = {
@@ -1897,6 +1903,7 @@ pub(crate) fn merged_stats() -> [u64; 7] {
 
 /// (Neptune) Whether a refresh of a copy in the card's memory sends up only the bytes that
 /// differ from what the copy holds (`VICTORY_COPY_CHANGED=1`; off by default).
+/// (Before it, [`STALE_KIND`].)
 ///
 /// A page counts as written when the kernel says so, and what our own copy-back writes into
 /// title memory counts too: some 1,500 pieces of 64 KiB a frame came back from the card,
@@ -2515,10 +2522,41 @@ unsafe impl Send for Shadow {}
 // SAFETY: as above.
 unsafe impl Sync for Shadow {}
 
+/// (Neptune) Bytes of stale pages copied since the last frame line, by what they were copied
+/// into: a window sent whole, mapped card memory, a copy in the card's memory, the others.
+static STALE_KIND: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// (Neptune) Whether a range taken whole and not written since is left as it is
+/// ([`Shadow::copy_stale`]; `VICTORY_RANGED=0`: its ends are copied at every refresh).
+fn ranged_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RANGED").is_none_or(|v| v != "0"))
+}
+
+/// (Neptune) Pages held in part by a range that were left as they were since the last frame
+/// line, because the range was taken whole before and they were not written since.
+static RANGED_LEFT: AtomicU64 = AtomicU64::new(0);
+
+/// [`RANGED_LEFT`], taken.
+pub(crate) fn ranged_left() -> u64 {
+    RANGED_LEFT.swap(0, Ordering::Relaxed)
+}
+
+/// [`STALE_KIND`], taken.
+pub(crate) fn stale_kind_stats() -> [u64; 4] {
+    [0, 1, 2, 3].map(|i| STALE_KIND[i].swap(0, std::sync::atomic::Ordering::Relaxed))
+}
+
 impl Shadow {
     /// The host GPU address of a title address inside the buffer.
     pub(crate) fn gpu(&self, address: u64) -> u64 {
         self.gpu + (address - self.start)
+    }
+
+    /// Whether the copy is of a window of memory outside title buffers,
+    /// not of a title buffer.
+    pub(crate) fn is_window(&self) -> bool {
+        self.window
     }
 
     /// The title memory the copy is of: its start and length.
@@ -2587,6 +2625,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            ranged: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
@@ -3416,6 +3455,14 @@ impl Shadow {
         }
     }
 
+    /// (Neptune, from avatarmanz/VIctory-7900XTX) The latest asking after which a range that
+    /// holds `[from, to)` was taken whole (0: none is known). The caller holds `copied`'s
+    /// lock.
+    fn ranged_at(&self, from: usize, to: usize) -> u64 {
+        let ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
+        ranged.iter().filter(|r| r.0 <= from && to <= r.1).map(|r| r.2).max().unwrap_or(0)
+    }
+
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
     /// asking), whole pages within the buffer.
@@ -3427,6 +3474,12 @@ impl Shadow {
         let last = (to - 1) / PAGE;
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let four_k = crate::watch::watch_4k();
+        // (Neptune, from avatarmanz/VIctory-7900XTX) Pages the range holds in part are never
+        // noted in `copied`, and were copied again at every refresh of the range, written or
+        // not: three fifths of the stale pages of a frame (2,900 of 4,900 in run ve163,
+        // with them most of its 200 MB). A range that was taken whole, and not written
+        // since, is as it was. `VICTORY_RANGED=0`: as before.
+        let ranged = if ranged_on() { self.ranged_at(from, to) } else { 0 };
         for page in from / PAGE..=last {
             let write = match writes.peek() {
                 Some(&&(p, w)) if p == page => {
@@ -3436,18 +3489,30 @@ impl Shadow {
                 _ => 0,
             };
             let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
+            let taken = (*at).max(ranged);
+            // A page only partly in the range is copied in part: it
+            // stays stale for the rest.
+            let whole = (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to;
+            if taken == 0 || write > taken {
                 // (Neptune) With VICTORY_WATCH_4K=1: only the 4 KiB pages written since.
-                let mask = crate::watch::stale_mask(page, *at);
+                let mask = crate::watch::stale_mask(page, taken, whole);
                 if four_k {
                     crate::watch::note_4k(mask);
                 }
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                if whole {
                     *at = now;
                 }
                 extend_runs(&mut run, &mut bytes_runs, page, mask.unwrap_or(u16::MAX));
+            } else if ranged > *at && !whole {
+                RANGED_LEFT.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        if ranged_on() {
+            // All of the range is in the copy as of this asking.
+            let mut ranged = self.ranged.lock().unwrap_or_else(|e| e.into_inner());
+            ranged[0] = (from, to, now);
+            if to - from >= ranged[1].1 - ranged[1].0 {
+                ranged[1] = (from, to, now);
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
@@ -3458,6 +3523,16 @@ impl Shadow {
                 bytes += self.copy(a, b);
             }
         }
+        let kind = if self.transient() {
+            0
+        } else if self.rebar {
+            1
+        } else if self.card.is_some() {
+            2
+        } else {
+            3
+        };
+        STALE_KIND[kind].fetch_add(bytes as u64, Ordering::Relaxed);
         bytes
     }
 
@@ -3918,6 +3993,31 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         });
     }
     found
+}
+
+/// Of title memory `[from, to)`: the parts that title buffer objects hold,
+/// joined where they touch, in order (`crate::pipeline::bvh_bound`).
+/// Buffers that begin more than 1 GiB before `from` are not looked for:
+/// memory inside such a buffer has the buffer's copy, not a window's.
+pub(crate) fn buffer_parts(from: u64, to: u64) -> Vec<(u64, u64)> {
+    const LOOKBACK: u64 = 1 << 30;
+    if from >= to {
+        return Vec::new();
+    }
+    let mut parts: Vec<(u64, u64)> = buffers()
+        .range((from.saturating_sub(LOOKBACK), 0)..(to, 0))
+        .filter(|&(&(start, _), e)| e.end > from && start < to)
+        .map(|(&(start, _), e)| (start.max(from), e.end.min(to)))
+        .collect();
+    parts.sort_unstable();
+    let mut out: Vec<(u64, u64)> = Vec::with_capacity(parts.len());
+    for (a, b) in parts {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
 }
 
 /// A title buffer exists at `start` (`len` bytes).

@@ -2499,6 +2499,16 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// (Neptune, from avatarmanz/VIctory-7900XTX b32fb997) Ranges declared written by
+    /// shaders since the list last wrote title memory (host copy, address, bytes):
+    /// declaring them again would change nothing.
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    /// (Neptune, from c96525db there) Scratch memory [`HostList::fill_scratch`] fills since
+    /// the list last wrote title memory (source, bytes): its host address.
+    filled: std::collections::HashMap<(usize, usize), u64>,
+    /// (Neptune, from ab86ef7f there) The pipelines [`HostList::bind_pipeline`] kept, by
+    /// address.
+    bound: std::collections::HashSet<usize>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
@@ -2539,6 +2549,25 @@ impl Deferred {
         self.upload_bytes += size;
         self.uploads.push(buffer);
     }
+
+    /// (Neptune) The steps recorded last write title memory: what was brought up to date
+    /// before them is not any more.
+    fn title_written(&mut self) {
+        self.refreshed.clear();
+        self.gpu_written.clear();
+        self.filled.clear();
+    }
+}
+
+/// (Neptune) Since the last frame line: ranges shaders write declared again and left out,
+/// fills of scratch memory for a root constant buffer left out, settings of the render
+/// targets a list had already, pipelines bound again and not kept again.
+pub(crate) static SAID_ONCE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// See [`HostList::defer_gpu_write`].
+fn declare_once() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DECLARE_ONCE").map_or(true, |v| v != "0"))
 }
 
 impl Drop for Deferred {
@@ -3282,6 +3311,7 @@ fn land() {
 /// value while the submitting thread waits for that thread would never
 /// see it.
 fn late_helper() {
+    crate::cores::keep_on_fast_cores("victory-late-wait");
     let Some(host) = host() else {
         return;
     };
@@ -3423,6 +3453,7 @@ struct OwnQueue {
 /// anything a caller of [`Host::settle`] may hold: resetting the landed
 /// lists and looking at what queues hold are left to [`late_helper`].
 fn relay_worker() {
+    crate::cores::keep_on_fast_cores("victory-relay");
     // (Neptune) This thread's jobs have kept threads of their own.
     crate::shadow::wide_for_back();
     let Some(host) = host() else {
@@ -6553,11 +6584,21 @@ impl HostList {
     ) -> Option<(&'static ID3D12Resource, u32)> {
         let texture = crate::resource::host_resource(resource)?;
         let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+        self.transition_copy(&copy, wanted).map(|before| (texture, before))
+    }
+
+    /// As [`HostList::transition`], for a host copy held by the caller (the
+    /// title's object may be gone): the state it leaves, if that is a change.
+    pub(crate) fn transition_copy(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        wanted: u32,
+    ) -> Option<u32> {
+        let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
+                v.insert((wanted, wanted, copy.clone()));
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
@@ -6565,7 +6606,7 @@ impl HostList {
                 if before != wanted {
                     self.changes.fetch_add(1, Ordering::Relaxed);
                 }
-                (before != wanted).then_some((texture, before))
+                (before != wanted).then_some(before)
             }
         }
     }
@@ -7015,7 +7056,7 @@ impl HostList {
         deferred
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
-        deferred.refreshed.clear();
+        deferred.title_written();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -7071,10 +7112,62 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        // (Neptune, from avatarmanz/VIctory-7900XTX b32fb997, itself from Belobug dd799aad)
+        // Declared once until the list next writes title memory (`VICTORY_DECLARE_ONCE=0`:
+        // every time): the dispatches of a frame declare the same few ranges thousands of
+        // times, each a step of its own for the thread that submits (a flush of its copy's
+        // pending refreshes and a snapshot), a look at every step for the plans made of
+        // them, and here the lock all lists share.
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        {
+            let mut deferred = self.deferred();
+            if !deferred.gpu_written.insert(key) && declare_once() {
+                SAID_ONCE[0].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            deferred.gpu_ranges.push((address, address + len));
+            deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+        }
         shader_writes(address, len);
-        let mut deferred = self.deferred();
-        deferred.gpu_ranges.push((address, address + len));
-        deferred.copies.push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    /// (Neptune, from avatarmanz/VIctory-7900XTX c96525db, itself from Belobug 84ea9c12)
+    /// The host address of `len` bytes of scratch memory that hold a constant buffer's
+    /// title memory at `src` as of the list's submission: one fill for every ask until the
+    /// list next writes title memory (up to 64 KiB of fill less for every repeat).
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        let known = self.deferred().filled.get(&key).copied();
+        if known.is_some() {
+            SAID_ONCE[1].fetch_add(1, Ordering::Relaxed);
+            return known;
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_constants(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
+    }
+
+    /// (Neptune, from avatarmanz/VIctory-7900XTX ab86ef7f, itself from Belobug 92d353f8)
+    /// The list binds a pipeline: it and its root signature are kept until the list is
+    /// reset, and its name noted, the first time only (a kept pipeline's address names no
+    /// other).
+    pub(crate) fn bind_pipeline(&self, name: &str, pso: &ID3D12PipelineState, root: &ID3D12RootSignature) {
+        {
+            let mut deferred = self.deferred();
+            if !deferred.bound.insert(pso.as_raw() as usize) {
+                drop(deferred);
+                SAID_ONCE[3].fetch_add(1, Ordering::Relaxed);
+                // The census counts every bind.
+                if census_on() {
+                    self.used_pipeline(name);
+                }
+                return;
+            }
+            deferred.kept.push(pso.clone().into());
+            deferred.kept.push(root.clone().into());
+        }
+        self.used_pipeline(name);
     }
 
     /// (Neptune) Whether shaders of the list, as recorded so far, may write
@@ -7282,8 +7375,12 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        // (Neptune) Title memory changes at this place in the list: a view or a table made
+        // ready before it is made ready again after it (`crate::draw`).
+        self.changes.fetch_add(1, Ordering::Relaxed);
+        let mut deferred = self.deferred();
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.title_written();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
@@ -8269,6 +8366,41 @@ impl Meter {
             );
         }
         {
+            let [declared, fills, targets, pipelines] = [0, 1, 2, 3].map(|i| SAID_ONCE[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "said once a list, per frame: {declared:.0} ranges shaders write declared again and left out \
+                 (VICTORY_DECLARE_ONCE=0: each a step), {fills:.0} fills of scratch memory for a root constant buffer \
+                 left out, {targets:.0} settings of the render targets the list had (VICTORY_BIND_CACHE=0: set), \
+                 {pipelines:.0} pipelines bound again and not kept again"
+            );
+        }
+        {
+            let [copied, made, ready] = [0, 1, 2].map(|i| crate::descriptor::host::LISTED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "slots of tables made afresh per frame, of views their list had made (VICTORY_LIST_VIEWS=0: each made by the \
+                 host): {copied:.0} copied from the list's own, {made:.0} made for it; {ready:.0} found ready as they were"
+            );
+        }
+        {
+            let [never, whole, untold, none, parts, ends] = crate::watch::stale_why_stats().map(|n| n as f64 / frames);
+            let left = crate::shadow::ranged_left() as f64 / frames;
+            let rested = crate::watch::rested() as f64 / frames;
+            let by = crate::watch::whole_by_stats().map(|n| n as f64 / frames);
+            let kinds = crate::shadow::stale_kind_stats().map(|n| n as f64 / frames / 1048576.0);
+            tracing::info!(
+                "stale 64 KiB pages of host copies per frame: {never:.0} never copied, {ends:.0} a range's ends never \
+                 noted copied ({left:.0} more left as they were, their range taken whole before; VICTORY_RANGED=0: copied), \
+                 {whole:.0} written whole, {rested:.0} blocks told written as they rest after a write fault                  (VICTORY_GUARD_REST=0: guarded again at once), \
+                 {untold:.0} with no 4 KiB table, {none:.0} with no 4 KiB page newer, {parts:.0} taken by their 4 KiB pages \
+                 (the last four with VICTORY_WATCH_4K=1); pages noted written whole per frame: {:.0} by the copy-back \
+                 through the title's view, {:.0} through a view of ours, {:.0} by our own writes, {:.0} told by the \
+                 runtime, {:.0} by guards; title writes found beside the copy-back's (by 4 KiB page): {:.0}; \
+                 copied per frame: {:.1} MB into windows sent whole, {:.1} into mapped card memory, {:.1} into \
+                 card copies, {:.1} into the others",
+                by[0], by[2], by[3], by[4], by[5], by[1], kinds[0], kinds[1], kinds[2], kinds[3]
+            );
+        }
+        {
             let [copies, joined] = [0, 1].map(|i| COPIES_JOINED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if copies > 0.0 {
                 tracing::info!(
@@ -8356,6 +8488,49 @@ impl Meter {
                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed),
                 crate::descriptor::host::KEPT_OTHER_VIEWS.load(Ordering::Relaxed)
             );
+            {
+                let a: Vec<u64> = crate::descriptor::host::QUEUE_AGE.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
+                if a.iter().sum::<u64>() != 0 {
+                    tracing::info!(
+                        "textures picked by index, done since the last line, by the frames after their slot was written:                          {} in the same frame, {} one later, {} two, {} three to five, {} six to fifteen, {} sixteen to 63, {} later still; {} passes made within frames to catch up, {:.1} ms a frame in them (VICTORY_TEXTURE_CATCH_UP_MS)",
+                        a[0], a[1], a[2], a[3], a[4], a[5], a[6],
+                        crate::draw::EARLY_CATCH_UPS.swap(0, Ordering::Relaxed),
+                        crate::draw::EARLY_CATCH_UP_MICROS.swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
+                    );
+                }
+            }
+            {
+                let (heaps, used, free) = crate::placement::stats();
+                let [placed, refused] = [0, 1].map(|i| crate::resource::TEXTURES_PLACED[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "host textures placed in heaps made ahead (VICTORY_TEXTURE_HEAPS=0: each a resource of its own), so far: {placed} \
+                     placed, {refused} refused there; {heaps} heaps hold {} MB of them and {} MB free",
+                    used >> 20,
+                    free >> 20
+                );
+            }
+            {
+                let left = crate::pipeline::LEFT_WITHOUT_RAYS.swap(0, Ordering::Relaxed);
+                tracing::info!(
+                    "dispatches of the program that activates the screen probes' rays left out per frame (no rays run; VICTORY_RAYS=1: it runs): {:.1}",
+                    left as f64 / frames
+                );
+            }
+            {
+                let [taken, new, put, out] = [0, 1, 2, 3].map(|i| crate::resource::TEXTURE_POOLED[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "host textures of textures the title fills, so far: {taken} taken from the pool of ones let go, {new} made new, \
+                     {put} put into the pool, {out} let go from it; the pool holds {} MB (VICTORY_TEXTURE_POOL_MB)",
+                    crate::resource::texture_pool_bytes() >> 20
+                );
+            }
+            {
+                let [kept, nulled, again] = [0, 1, 2].map(|i| crate::descriptor::host::STALE_KEPT[i].load(Ordering::Relaxed));
+                tracing::info!(
+                    "slots whose view a newer view made stale, so far: {kept} went on showing their texture (VICTORY_STALE_KEEP_MS=0: \
+                     null at once), {again} of them were made again in that time, {nulled} were made null when it was up"
+                );
+            }
             crate::tiles::status();
             {
                 let [same, changed, waiting] =

@@ -61,6 +61,9 @@ const DEVICES: usize = PADS + 2;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
+/// (Neptune) The key that is the stand-in pad's A: the space bar (it was Enter).
+const A_KEY: u8 = 0x20;
+
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
 const FALLBACK_BUTTONS: [(u8, u32); 18] = [
@@ -72,7 +75,7 @@ const FALLBACK_BUTTONS: [(u8, u32); 18] = [
     (0xA3, RIGHT_STICK),
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
-    (0x0D, A),    // Enter
+    (A_KEY, A),   // Space
     (0x08, B),    // Backspace
     (b'X', X),
     (b'Y', Y),
@@ -1205,16 +1208,16 @@ mod host {
                     .collect();
                 down.extend(held);
             }
-            // (Neptune) `VICTORY_AUTO_A=<seconds>`: for that long after the start, Enter
-            // (the stand-in pad's A) is down for a quarter of a second in every four,
+            // (Neptune) `VICTORY_AUTO_A=<seconds>`: for that long after the start, the key
+            // of the stand-in pad's A is down for a quarter of a second in every four,
             // whether or not the window has focus: a launch gets through the title's
             // "press A" screens without the focus being taken from what the user does.
             static AUTO_A: LazyLock<u64> = LazyLock::new(|| {
                 std::env::var("VICTORY_AUTO_A").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0)
             });
             let run = super::START.elapsed();
-            if run.as_secs() < *AUTO_A && run.as_millis() % 4000 < 250 && !down.contains(&0x0D) {
-                down.push(0x0D);
+            if run.as_secs() < *AUTO_A && run.as_millis() % 4000 < 250 && !down.contains(&A_KEY) {
+                down.push(A_KEY);
             }
             down.into_iter()
                 .map(|vk| KeyState {
@@ -1240,7 +1243,7 @@ mod host {
 
     /// Debugging aid: `VICTORY_KEYS=<seconds>:<key>,...` holds each key for
     /// 0.2 s that long after input starts, with or without focus. A key is a
-    /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
+    /// letter, a digit, or `Space`, `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
     #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
@@ -1249,6 +1252,7 @@ mod host {
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
                 let vk = match key.trim() {
+                    "Space" => 0x20,
                     "Enter" => 0x0D,
                     "Esc" => 0x1B,
                     "Tab" => 0x09,
@@ -1657,7 +1661,7 @@ mod tests {
         register(hub, KEYBOARD_KIND, 2, &log);
         assert_eq!(*log.lock().unwrap(), [(KEYBOARD, STATUS_CONNECTED, 0)]);
 
-        let keys = vec![key(b'W'), key(0x0D), key(b'L'), key(b'C')];
+        let keys = vec![key(b'W'), key(A_KEY), key(b'L'), key(b'C')];
         host.lock().unwrap().keys = keys.clone();
         hub.poll();
         let r = current(hub, KEYBOARD_KIND, KEYBOARD).unwrap();

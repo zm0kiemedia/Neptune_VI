@@ -65,6 +65,13 @@ pub(crate) struct Shader {
     /// (`crate::ambient`).
     #[cfg(windows)]
     pub(crate) resolves_light: bool,
+    /// It draws the sky as the title reflects it ([`crate::ambient::SKY`]).
+    #[cfg(windows)]
+    pub(crate) draws_sky: bool,
+    /// It writes the title's reflections for the last time in a frame
+    /// ([`crate::ambient::REFLECTED`]).
+    #[cfg(windows)]
+    pub(crate) ends_reflections: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
 }
@@ -118,6 +125,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 #[cfg(windows)]
                 resolves_light: bytes.windows(crate::ambient::PROGRAM.len()).any(|w| w == crate::ambient::PROGRAM),
                 #[cfg(windows)]
+                draws_sky: bytes.windows(crate::ambient::SKY.len()).any(|w| w == crate::ambient::SKY),
+                #[cfg(windows)]
+                ends_reflections: bytes.windows(crate::ambient::REFLECTED.len()).any(|w| w == crate::ambient::REFLECTED),
+                #[cfg(windows)]
                 translated: OnceLock::new(),
             })
         })
@@ -137,6 +148,8 @@ pub fn warm(stage: &'static str, container: &[u8], compute: bool) -> (bool, Opti
         hash: full.to_hex()[..16].to_owned(),
         container: container.to_vec(),
         resolves_light: container.windows(crate::ambient::PROGRAM.len()).any(|w| w == crate::ambient::PROGRAM),
+        draws_sky: container.windows(crate::ambient::SKY.len()).any(|w| w == crate::ambient::SKY),
+        ends_reflections: container.windows(crate::ambient::REFLECTED.len()).any(|w| w == crate::ambient::REFLECTED),
         translated: OnceLock::new(),
     });
     let translated = shader.translated().is_some();
@@ -152,6 +165,8 @@ pub(crate) struct Translated {
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether the shader walks ray-tracing structures ([`walks`]).
+    pub(crate) walks: bool,
     /// The host DXIL, moved out of `host`: read only to make a pipeline. With
     /// `VICTORY_DROP_DXIL=1` it is let go after each pipeline and translated
     /// again (the disk cache) when another needs it ([`Shader::dxil`]).
@@ -257,6 +272,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
     let mut host = crate::shader_cache::host_shader(container)?;
     let dxil = Mutex::new(Some(Arc::new(std::mem::take(&mut host.dxil))));
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let walks = programs.iter().any(walks);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -267,7 +283,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores, dxil })
+    Ok(Translated { host, used, stores, walks, dxil })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -336,10 +352,152 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
+/// (Neptune) Whether the pipeline's program only makes sense with the title's rays, which do
+/// not run: the program that tells the screen probes which rays to trace
+/// (`CS_ScreenProbes_ActivateRays`). Found and left out by Belobug
+/// (Belobug/VIctory-Belobug-AMD 6986a571): once it ran, with no rays behind it, the whole
+/// picture lost light, shadows and reflections. It did not run here either until every
+/// pipeline of the title translated (the translator of soldsawn/victory-nvidia-8gb), which
+/// is when shadows of lamps and reflections went. `VICTORY_RAYS=1` has it run.
+#[cfg(windows)]
+fn idle_without_rays(shaders: &[Arc<Shader>]) -> bool {
+    const NAME: &[u8] = b"CS_ScreenProbes_ActivateRays";
+    static RAYS: OnceLock<bool> = OnceLock::new();
+    !*RAYS.get_or_init(|| std::env::var_os("VICTORY_RAYS").is_some_and(|v| v == "1"))
+        && shaders.iter().any(|s| s.container.windows(NAME.len()).any(|w| w == NAME))
+}
+
+/// (Neptune) Whether the dispatches of the title's pipeline `this` are left out because the
+/// rays it serves do not run ([`idle_without_rays`]).
+#[cfg(windows)]
+pub(crate) fn left_without_rays(this: This) -> bool {
+    !this.is_null() && pipeline(this).no_rays
+}
+
+/// (Neptune) Since the last frame line: dispatches left out by [`left_without_rays`].
+#[cfg(windows)]
+pub(crate) static LEFT_WITHOUT_RAYS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether what the structure builder's stages store into title memory
+/// outside title buffer objects stays in the host's copies
+/// (`VICTORY_BVH_BOUND`, on unless `0`).
+///
+/// The builder reaches memory by raw address, and each such dispatch
+/// declared every copy it had numbered written: mostly 4 MiB windows of
+/// memory outside buffers, in which the title's own objects lie beside
+/// whatever the builder meant to write. Whatever the builder stored there
+/// went back into title memory, byte for byte. In the run with the builder
+/// on (2026-11-24, `bvh-builder`) windows had 1.5 MB a frame written back,
+/// and four seconds after the builder started the title read a pointer of
+/// 0xff800000ff800000 (two floats of minus infinity, the empty bounding
+/// box a builder stage starts with) and died.
+///
+/// Direct3D puts a ray-tracing structure, its scratch memory and its
+/// post-build results in buffer objects, so with the switch a builder
+/// dispatch declares written only the parts of a window that title buffers
+/// hold (`crate::shadow::buffer_parts`); its root UAVs likewise. A title
+/// buffer's own copy is declared whole, as before. What the builder stores
+/// elsewhere stays in the host copy, where the programs that walk the
+/// structures read it, until the title writes that page and a refresh
+/// puts the title's bytes back (as with `VICTORY_BVH_QUARANTINE`, for
+/// that memory only). The memory line counts the bytes left out.
+#[cfg(windows)]
+pub(crate) fn bvh_bound() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUND").is_none_or(|v| v != "0"))
+}
+
+/// Bytes of windows a builder dispatch did not declare written
+/// ([`bvh_bound`]), and of them declared because title buffers hold them,
+/// since the last frame-rate line.
+#[cfg(windows)]
+pub(crate) static BVH_BOUND_BYTES: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Declares `[address, address + len)` of `shadow` written by `list`'s
+/// shaders, as [`crate::shadow::Shadow::gpu_writes`] does; for a stage of
+/// the structure builder with [`bvh_bound`], only what title buffers hold
+/// of a window.
+#[cfg(windows)]
+pub(crate) fn builder_writes(
+    list: &crate::host::HostList,
+    shadow: &Arc<crate::shadow::Shadow>,
+    address: u64,
+    len: u64,
+    builder: bool,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !(builder && bvh_bound() && shadow.is_window()) {
+        shadow.gpu_writes(list, address, len);
+        return;
+    }
+    let parts = crate::shadow::buffer_parts(address, address.saturating_add(len));
+    let held: u64 = parts.iter().map(|&(a, b)| b - a).sum();
+    BVH_BOUND_BYTES[0].fetch_add(len.saturating_sub(held), Relaxed);
+    BVH_BOUND_BYTES[1].fetch_add(held, Relaxed);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::info!(
+            window = format_args!("{address:#x}+{len:#x}"),
+            buffers = parts.len(),
+            held,
+            "the structure builder's stores outside title buffers stay in the host's copies (VICTORY_BVH_BOUND=0 copies them back)"
+        );
+    });
+    for (a, b) in parts {
+        shadow.gpu_writes(list, a, b - a);
+    }
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
+}
+
+/// Set while the builder's stages run: from the first dispatch that found
+/// every builder pipeline made, until one is dropped.
+#[cfg(windows)]
+static BUILDER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the structure builder runs, so that the structures in title
+/// memory are ones it built. While it does not, the programs that walk
+/// them are given empty ones (`memory::empty`): what lies at a structure's
+/// address is then not a structure.
+#[cfg(windows)]
+pub(crate) fn builder_live() -> bool {
+    BUILDER_LIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Says, at the builder's first dropped dispatches while it is not asked
+/// for, how many of its pipelines the title has created and how many of
+/// them the host has: what `VICTORY_BVH_BUILDER=1` would find
+/// (diagnostics).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn builder_census() {
+    static DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    // The first is too early for the workers; the later ones say how it ended.
+    if !matches!(n, 1 | 4_096 | 65_536) {
+        return;
+    }
+    let b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
+    let (mut made, mut making, mut refused) = (0, 0, 0);
+    for p in &b.pipelines {
+        match make::missing(p) {
+            None => made += 1,
+            Some(why) if why.ends_with("being made") => making += 1,
+            Some(_) => refused += 1,
+        }
+    }
+    tracing::info!(
+        dropped_so_far = n,
+        created = b.pipelines.len(),
+        made,
+        making,
+        refused,
+        "the ray-tracing structure builder is off (VICTORY_BVH_BUILDER=1 asks for it): its pipelines the title has created, by whether the host has them; it runs only with none refused"
+    );
 }
 
 /// A stage of the builder was dropped after all: none runs from here on.
@@ -348,6 +506,7 @@ pub(crate) fn builder_off(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
     if !b.off {
         b.off = true;
+        BUILDER_LIVE.store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
     }
 }
@@ -358,6 +517,8 @@ pub(crate) fn builder_off(why: &'static str) {
 pub(crate) fn builder_runs() -> bool {
     static ALLOWED: OnceLock<bool> = OnceLock::new();
     if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+        #[cfg(feature = "diagnostics")]
+        builder_census();
         return false;
     }
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
@@ -370,6 +531,7 @@ pub(crate) fn builder_runs() -> bool {
     let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
     if missing > 0 {
         b.off = true;
+        BUILDER_LIVE.store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             missing,
             of = b.pipelines.len(),
@@ -382,7 +544,16 @@ pub(crate) fn builder_runs() -> bool {
         "the ray-tracing structure builder runs: all of its programs have host pipelines"
     );
     b.whole = true;
+    BUILDER_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
     true
+}
+
+/// Whether a console program walks ray-tracing structures: it has one of
+/// the two instructions that test a ray against a node of one.
+#[cfg(windows)]
+fn walks(program: &victory_shader::NativeProgram) -> bool {
+    victory_shader::gfx10::decode(&program.code)
+        .is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
 }
 
 /// Whether a console program can store to buffer memory: it has a buffer,
@@ -429,6 +600,10 @@ struct Pipeline {
     /// One of the ray-tracing structure builder's ([`Builder`]).
     #[cfg(windows)]
     builder: bool,
+    /// (Neptune) It only serves the title's rays, which do not run ([`idle_without_rays`]):
+    /// its dispatches are left out.
+    #[cfg(windows)]
+    no_rays: bool,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -597,6 +772,8 @@ fn hand_out(
     #[cfg(windows)]
     make::early(&host);
     #[cfg(windows)]
+    let no_rays = idle_without_rays(&shaders);
+    #[cfg(windows)]
     let builder = of_builder(&shaders);
     #[cfg(windows)]
     if builder {
@@ -612,6 +789,8 @@ fn hand_out(
         host,
         #[cfg(windows)]
         builder,
+        #[cfg(windows)]
+        no_rays,
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
     });
