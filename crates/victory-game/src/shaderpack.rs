@@ -307,13 +307,16 @@ pub fn find(file: &[u8]) -> Option<std::borrow::Cow<'_, [u8]>> {
     let mut chunk = vec![0u8; 0x20000];
     // One zlib stream at `at`: its output and the bytes it took.
     let mut inflate = |at: usize| {
-        use miniz_oxide::inflate::core::{DecompressorOxide, decompress, inflate_flags};
-        use miniz_oxide::inflate::TINFLStatus;
-        let flags = inflate_flags::TINFL_FLAG_PARSE_ZLIB_HEADER
-            | inflate_flags::TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
-        let (status, used, out) =
-            decompress(&mut DecompressorOxide::new(), file.get(at..)?, &mut chunk, 0, flags);
-        (status == TINFLStatus::Done).then(|| (chunk[..out].to_vec(), used))
+        let mut state = zlib_rs::Inflate::new(true, 15);
+        let status = state
+            .decompress(file.get(at..)?, &mut chunk, zlib_rs::InflateFlush::NoFlush)
+            .ok()?;
+        (status == zlib_rs::Status::StreamEnd).then(|| {
+            (
+                chunk[..state.total_out() as usize].to_vec(),
+                state.total_in() as usize,
+            )
+        })
     };
     let zlib = |at: usize| {
         file[at] == 0x78 && u16::from_be_bytes([file[at], file[at + 1]]).is_multiple_of(31)
@@ -473,11 +476,21 @@ mod tests {
         let pack = pack_bytes();
         // Junk (with a zlib stream of something else), then the pack in
         // chunks of 100 bytes, each stream at a multiple of 16.
+        let compress_zlib = |data: &[u8]| {
+            let mut buf = vec![0u8; zlib_rs::compress_bound(data.len())];
+            let config = zlib_rs::DeflateConfig {
+                window_bits: 15,
+                ..zlib_rs::DeflateConfig::new(6)
+            };
+            let (packed, rc) = zlib_rs::compress_slice(&mut buf, data, config);
+            assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+            packed.to_vec()
+        };
         let mut archive = vec![0x5A; 0x103];
-        archive.extend(miniz_oxide::deflate::compress_to_vec_zlib(b"not a pack", 6));
+        archive.extend(compress_zlib(b"not a pack"));
         for part in pack.chunks(100) {
             archive.resize(archive.len().next_multiple_of(16), 0);
-            archive.extend(miniz_oxide::deflate::compress_to_vec_zlib(part, 6));
+            archive.extend(compress_zlib(part));
         }
         archive.extend([0; 40]);
         assert_eq!(find(&archive).as_deref(), Some(&pack[..]));
