@@ -24,6 +24,9 @@ pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, native_programs,
 };
 
+/// Build-time identity of the translator and its compile inputs.
+pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
     #[error("not a DXBC container")]

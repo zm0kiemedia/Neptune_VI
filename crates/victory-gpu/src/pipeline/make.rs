@@ -31,7 +31,7 @@ pub(crate) struct Pending {
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
-    key: String,
+    pub(super) key: String,
     used: AtomicBool,
 }
 
@@ -43,18 +43,13 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
-        let mut key = blake3::Hasher::new();
-        for s in &shaders {
-            key.update(s.stage.as_bytes());
-            key.update(s.hash.as_bytes());
-        }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let key = key(&shaders, graphics.as_deref());
         Pending {
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
+            key,
             used: AtomicBool::new(false),
         }
     }
@@ -66,6 +61,17 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// Identifies the title pipeline by its shader containers and graphics state.
+pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
+    let mut key = blake3::Hasher::new();
+    for shader in shaders {
+        key.update(shader.stage.as_bytes());
+        key.update(shader.hash.as_bytes());
+    }
+    key.update(graphics.map(GraphicsState::describe).unwrap_or_default().as_bytes());
+    key.finalize().to_hex()[..32].to_owned()
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do

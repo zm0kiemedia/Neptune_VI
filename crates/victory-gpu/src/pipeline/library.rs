@@ -697,6 +697,11 @@ fn used() -> std::sync::MutexGuard<'static, Option<HashSet<String>>> {
 }
 
 /// Whether the title pipeline with `key` was requested in this or an earlier run.
+/// Open the early list before a cache save that has no title draws.
+pub(crate) fn keep_early_list() {
+    drop(used());
+}
+
 pub(crate) fn wanted_early(key: &str) -> bool {
     used().as_ref().is_some_and(|s| s.contains(key))
 }

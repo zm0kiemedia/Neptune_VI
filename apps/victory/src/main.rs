@@ -5,6 +5,8 @@
 
 mod census;
 mod inspect;
+#[cfg(windows)]
+mod prebuild;
 mod run;
 mod shader;
 mod translate;
@@ -66,6 +68,9 @@ enum Command {
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
         disasm: bool,
+        /// Show the effects, techniques, and passes in shader databases.
+        #[arg(long)]
+        effects: bool,
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
@@ -75,15 +80,21 @@ enum Command {
         /// else the newest Windows SDK's).
         #[arg(long)]
         validate: bool,
-        /// Also create a host D3D12 pipeline for each emitted shader.
+        /// Check host pipelines, or prebuild the shader pack's pipelines with --cache.
         #[arg(long)]
         pipelines: bool,
+        /// Prebuild only shader-pack pipelines requested by earlier runs in this cache.
+        #[arg(long, requires_all = ["cache", "pipelines"])]
+        used_pipelines: bool,
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Fill the shader cache that `run` reads.
+        #[arg(long, conflicts_with_all = ["validate", "list"])]
+        cache: bool,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -145,13 +156,24 @@ fn main() -> Result<()> {
             paths,
             verbose,
             disasm,
-        } => shader::run(paths, verbose || disasm, disasm),
+            effects,
+        } => shader::run(paths, verbose || disasm, disasm, effects),
+        Command::Translate {
+            paths,
+            jobs,
+            pipelines,
+            used_pipelines,
+            cache: true,
+            ..
+        } => translate::warm(paths, jobs, pipelines, used_pipelines),
         Command::Translate {
             paths,
             validate,
             pipelines,
             list,
             jobs,
+            cache: false,
+            ..
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
