@@ -126,6 +126,15 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     result
 }
 
+/// Whether `container` is already in the on-disk shader cache for the current target.
+pub(crate) fn is_cached(container: &[u8]) -> bool {
+    let Some(cache) = CACHE.get() else {
+        return false;
+    };
+    let key = shader_key(build(), target(), canonical_container(container));
+    cache.path_for(&key).exists()
+}
+
 fn target() -> [u32; 2] {
     [
         victory_shader::emit::host_max_wave(),
