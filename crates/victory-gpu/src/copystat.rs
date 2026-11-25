@@ -778,6 +778,10 @@ fn log_memory() {
         made[4],
         mb(made[5]),
     );
+    tracing::info!(
+        "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
+        crate::resource::placed_filler_twins()
+    );
     // What the line above leaves open: what is alive of the buffers "made
     // so far", what the windows hold and what holds them, and what our own
     // code has allocated.
