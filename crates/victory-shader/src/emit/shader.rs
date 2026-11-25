@@ -679,6 +679,16 @@ impl Shader {
             self.m.named_md("dx.viewIdState", vec![view_node]);
         }
 
+        // DXIL requires every signature element packed into the same row to
+        // share one interpolation mode. Integer / SV_IsFrontFace elements must
+        // stay constant (1); otherwise a read element's mode wins over unread
+        // siblings in the same row.
+        if self.pixel {
+            reconcile_row_interp(&mut self.inputs);
+        } else if graphics {
+            reconcile_row_interp(&mut self.outputs);
+        }
+
         let sigs = if graphics {
             let ins = self.signature_md(self.inputs.clone());
             let outs = self.signature_md(self.outputs.clone());
@@ -886,5 +896,75 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+/// Ensures elements sharing a signature row declare one DXIL interpolation
+/// mode. Any integer or `SV_IsFrontFace` element forces the row to `constant`
+/// (`1`); otherwise, a used element's mode overrides unread siblings.
+fn reconcile_row_interp(elems: &mut [SigElement]) {
+    let mut row_mode: std::collections::HashMap<u32, (bool, Option<u8>)> =
+        std::collections::HashMap::new();
+    for e in elems.iter() {
+        let Some(row) = e.row else { continue };
+        if e.interp == 0 {
+            continue;
+        }
+        let entry = row_mode.entry(row).or_insert((false, None));
+        if e.kind == 13 || e.comp != 9 {
+            entry.0 = true;
+        } else if e.usage != 0 && entry.1.is_none() {
+            entry.1 = Some(e.interp);
+        }
+    }
+    for e in elems.iter_mut() {
+        let Some(row) = e.row else { continue };
+        if e.interp == 0 {
+            continue;
+        }
+        if let Some(&(force_const, used_mode)) = row_mode.get(&row) {
+            if force_const {
+                e.interp = 1;
+            } else if e.usage == 0
+                && let Some(m) = used_mode
+            {
+                e.interp = m;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn elem(name: &str, kind: u8, comp: u8, interp: u8, row: u32, col: u8, usage: u8) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp,
+            interp,
+            row: Some(row),
+            col,
+            cols: 1,
+            usage,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn reconcile_row_interp_matches_constant_and_used_siblings() {
+        let mut elems = vec![
+            elem("TEXCOORD", 0, 9, 2, 7, 0, 0),
+            elem("SV_IsFrontFace", 13, 5, 1, 7, 1, 1),
+            elem("TEXCOORD", 0, 9, 2, 8, 0, 0),
+            elem("TEXCOORD", 0, 9, 3, 8, 1, 1),
+        ];
+        reconcile_row_interp(&mut elems);
+        assert_eq!(elems[0].interp, 1);
+        assert_eq!(elems[1].interp, 1);
+        assert_eq!(elems[2].interp, 3);
+        assert_eq!(elems[3].interp, 3);
     }
 }
