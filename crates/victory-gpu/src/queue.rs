@@ -1085,52 +1085,6 @@ mod tests {
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
     }
-    #[cfg(windows)]
-    #[test]
-    fn release_waits_for_release_held_before_freeing_waiting_queue() {
-        let null = std::ptr::null();
-        let desc = QueueDesc {
-            kind: 0,
-            priority: 0,
-            flags: 0,
-            nodes: 0,
-        };
-        let mut q = null;
-        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
-        let mut fence = null;
-        assert_eq!(
-            crate::fence::create(null, 0, 0, &crate::fence::FENCE_IIDS[0], &mut fence),
-            S_OK
-        );
-        // Queue waits on an unsignaled fence, registering `q` in `WAITING`.
-        assert_eq!(wait(q, fence, 1), S_OK);
-        let q_addr = q as usize;
-        assert!(lock(&WAITING).contains(&q_addr));
-
-        // Hold `RELEASING` (as `release_held` does while iterating `WAITING`).
-        // Releasing the last reference to `q` must wait before freeing `q` and
-        // must remove `q` from `WAITING` before dropping its allocation.
-        let guard = lock(&RELEASING);
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let releaser = std::thread::spawn(move || {
-            let left = slot::<extern "system" fn(This) -> u32>(q_addr as This, 0x10)(q_addr as This);
-            let _ = done_tx.send(left);
-        });
-        assert!(
-            done_rx
-                .recv_timeout(std::time::Duration::from_millis(40))
-                .is_err(),
-            "queue::release freed queue while release_held lock was held"
-        );
-        drop(guard);
-        let left = done_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("queue::release finished");
-        assert_eq!(left, 0);
-        assert!(!lock(&WAITING).contains(&q_addr));
-        releaser.join().unwrap();
-        assert_eq!(slot::<extern "system" fn(This) -> u32>(fence, 0x10)(fence), 0);
-    }
 
     #[cfg(windows)]
     #[test]

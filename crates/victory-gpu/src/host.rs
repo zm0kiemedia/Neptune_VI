@@ -1453,7 +1453,7 @@ fn take_chunk(host: &Host, size: u64) -> Option<Chunk> {
         ALIVE[5].fetch_add(1, Ordering::Relaxed);
         return Some(chunk);
     }
-    let (buffer, data) = host.upload_buffer(size)?;
+    let (buffer, data) = host.gpu_upload_buffer(size)?;
     name(&buffer, || "list scratch".into());
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -2922,6 +2922,32 @@ impl Host {
             };
             let supported = ok && options.DepthBoundsTestSupported.as_bool();
             tracing::info!(supported, "host depth bounds support");
+            supported
+        })
+    }
+
+    /// Whether the host GPU supports `D3D12_HEAP_TYPE_GPU_UPLOAD` (Resizable BAR)
+    /// and it has not been disabled with `VICTORY_GPU_UPLOAD=0`; logged once.
+    pub(crate) fn gpu_upload_supported(&self) -> bool {
+        static SUPPORTED: OnceLock<bool> = OnceLock::new();
+        *SUPPORTED.get_or_init(|| {
+            if std::env::var_os("VICTORY_GPU_UPLOAD").is_some_and(|v| v == "0") {
+                tracing::info!("host GPU upload heap (ReBAR) disabled by VICTORY_GPU_UPLOAD=0");
+                return false;
+            }
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: querying a D3D12 feature struct on a live device.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS16,
+                        (&raw mut options).cast(),
+                        size_of_val(&options) as u32,
+                    )
+                    .is_ok()
+            };
+            let supported = ok && options.GPUUploadHeapSupported.as_bool();
+            tracing::info!(supported, "host GPU upload heap (ReBAR) support");
             supported
         })
     }
@@ -5166,7 +5192,7 @@ impl HostList {
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
+            let (buffer, data) = host.gpu_upload_buffer(len)?;
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5856,6 +5882,60 @@ impl Host {
                 tracing::warn!(error = %e, size, "no upload buffer");
                 None
             }
+        }
+    }
+
+    /// A CPU-write / GPU-read buffer placed directly in VRAM via ReBAR
+    /// (`D3D12_HEAP_TYPE_GPU_UPLOAD`) when supported, falling back cleanly to
+    /// [`Self::upload_buffer`] on non-ReBAR GPUs or VRAM pressure.
+    /// Callers MUST NOT read back from the mapped pointer on the CPU.
+    pub(crate) fn gpu_upload_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if !self.gpu_upload_supported() {
+            return self.upload_buffer(size);
+        }
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        let read_none = D3D12_RANGE { Begin: 0, End: 0 };
+        // SAFETY: plain creation and write-only mapping of a GPU upload buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut buffer,
+                )
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, Some(&read_none), Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => {
+                MADE[0].fetch_add(1, Ordering::Relaxed);
+                MADE[1].fetch_add(size, Ordering::Relaxed);
+                Some((buffer?, data.cast()))
+            }
+            Err(_) => self.upload_buffer(size),
         }
     }
 }
@@ -7258,5 +7338,25 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         // Execute `[&list_a, &list_a]` end-to-end on the real/WARP adapter.
         host.execute(&[&list_a, &list_a]);
         assert_eq!(copy.state.load(Ordering::Relaxed), PIXEL_SHADER_RESOURCE);
+    }
+
+    #[test]
+    fn gpu_upload_heap_allocates_and_maps() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let Some(host) = super::host() else {
+            return;
+        };
+        let rebar = host.gpu_upload_supported();
+        let (buf, ptr) = host.gpu_upload_buffer(4096).expect("gpu_upload_buffer");
+        assert!(!ptr.is_null());
+        // SAFETY: 4096-byte write-only mapped buffer.
+        unsafe { std::ptr::write_bytes(ptr, 0xAB, 4096) };
+        let mut props = D3D12_HEAP_PROPERTIES::default();
+        // SAFETY: live committed resource.
+        unsafe { buf.GetHeapProperties(Some(&mut props), None) }.unwrap();
+        eprintln!("ReBAR GPUUploadHeapSupported={rebar}, actual heap type={:?}", props.Type);
+        if rebar {
+            assert_eq!(props.Type, D3D12_HEAP_TYPE_GPU_UPLOAD);
+        }
     }
 }
