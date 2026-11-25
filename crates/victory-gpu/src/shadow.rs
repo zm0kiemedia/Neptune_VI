@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
 
@@ -48,7 +48,7 @@ pub(crate) struct Shadow {
     /// shaders write (`pending`), each at its offset in the copy: what the
     /// GPU wrote differs. Room for the whole copy; only those ranges' bytes
     /// are set (and read).
-    before: Mutex<Option<Vec<u8>>>,
+    before: RwLock<Option<Vec<u8>>>,
     /// With snapshots kept ([`keeps`]): which 64 KiB pieces of the snapshot
     /// hold the copy's bytes as they are now, and whether the snapshot is
     /// counted in [`KEPT_BYTES`].
@@ -813,6 +813,138 @@ mod relay_tests {
         merge_piece(&fetched, &mut wrong_cpu, &mut wrong_title);
         assert_eq!(wrong_title[30], base[30]);
     }
+
+    /// `merge_card_relay_span` trims each `outside` sub-range independently
+    /// so skipped ranges (and gaps between them) are never written back,
+    /// and an unmapped page inside `skip` or between shader writes never
+    /// drops writes targeting mapped pages.
+    #[test]
+    fn card_merge_relay_span_skips_cpu_ranges_and_preserves_writes_across_unmapped_page() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const OS_PAGE: usize = 4096;
+        let len = 3 * OS_PAGE;
+        // SAFETY: fresh reserved 3-page region; pages 0 and 2 committed, page 1 unmapped.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_RESERVE, PAGE_READWRITE) } as *mut u8;
+        assert!(!base.is_null());
+        unsafe {
+            assert!(!VirtualAlloc(base.cast(), OS_PAGE, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(
+                !VirtualAlloc(base.add(2 * OS_PAGE).cast(), OS_PAGE, MEM_COMMIT, PAGE_READWRITE)
+                    .is_null()
+            );
+            std::ptr::write_bytes(base, 0x11, OS_PAGE);
+            std::ptr::write_bytes(base.add(2 * OS_PAGE), 0x22, OS_PAGE);
+        }
+        let start = base as usize;
+
+        // Case 1: skipped CPU write at [0..16) (gpu != held), unmapped page 1
+        // at [4096..8192) inside skip, and shader write at [8192..8196).
+        // Only the 4 bytes at [8192..8196) should be written to title memory.
+        let mut held = vec![0x22u8; len];
+        held[..OS_PAGE].fill(0x11);
+        held[0..16].fill(0x77); // CPU-written bytes not yet on card
+        let mut gpu = held.clone();
+        gpu[0..16].fill(0x11); // card still has old bytes in skip range
+        gpu[2 * OS_PAGE..2 * OS_PAGE + 4].fill(0xa5); // shader write on page 2
+        let mut scratch = Vec::new();
+        let written = super::merge_card_relay_span(
+            start,
+            0,
+            &gpu,
+            &mut held,
+            vec![(0, 16), (OS_PAGE, 2 * OS_PAGE)],
+            &mut scratch,
+        );
+        assert_eq!(written, 4, "must write only the 4-byte shader diff, not skipped range");
+        // SAFETY: pages 0 and 2 are committed and readable.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(base, 16), &[0x11; 16]);
+            assert_eq!(std::slice::from_raw_parts(base.add(2 * OS_PAGE), 4), &[0xa5; 4]);
+            assert_eq!(std::slice::from_raw_parts(base.add(2 * OS_PAGE + 4), 4), &[0x22; 4]);
+        }
+        assert_eq!(&held[0..16], &[0x77; 16], "skipped range must stay at CPU's bytes");
+        assert_eq!(&held[2 * OS_PAGE..2 * OS_PAGE + 4], &[0xa5; 4]);
+
+        // Case 2: unmapped page 1 is NOT in `skip`, with shader writes on both
+        // page 0 and page 2 inside one `outside` span. Page-level fallback
+        // must preserve both mapped writes.
+        gpu[100..104].fill(0x5b);
+        gpu[2 * OS_PAGE + 8..2 * OS_PAGE + 12].fill(0x6c);
+        let written = super::merge_card_relay_span(start, 0, &gpu, &mut held, vec![(0, 16)], &mut scratch);
+        assert!(written > 0);
+        // SAFETY: pages 0 and 2 are committed and readable.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts(base.add(100), 4), &[0x5b; 4]);
+            assert_eq!(std::slice::from_raw_parts(base.add(2 * OS_PAGE + 8), 4), &[0x6c; 4]);
+            assert_eq!(std::slice::from_raw_parts(base, 16), &[0x11; 16]);
+        }
+
+        // SAFETY: releases the reserved region.
+        unsafe { VirtualFree(base.cast(), 0, MEM_RELEASE) };
+    }
+
+    /// `find_all` deduplicates repeated shadows in one batch without
+    /// deadlocking and blocks while a writer holds `Shadow::before`.
+    #[test]
+    fn find_all_synchronizes_with_before_write_lock_and_deduplicates_shadows() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let len = 8192usize;
+        let Some((buffer, data)) = host.shared_buffer(len as u64) else {
+            return;
+        };
+        let start = 0x1000_0000u64;
+        // SAFETY: live D3D12 buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let shadow = std::sync::Arc::new(super::Shadow::new(buffer, data, gpu, start, len as u64));
+        // SAFETY: `data` is mapped for `len` bytes.
+        unsafe {
+            std::ptr::write_bytes(data, 0x10, len);
+            *data.add(64) = 0x99;
+        }
+        *shadow.before.write().unwrap() = Some(vec![0x10u8; len]);
+
+        // Duplicate entries for the same Shadow must not deadlock and must
+        // report the differing piece for the matching slice.
+        let work = vec![
+            (shadow.clone(), start as usize, start as usize + 4096),
+            (shadow.clone(), start as usize + 4096, start as usize + len),
+        ];
+        let found = super::find_all(&work);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0], vec![(0, 4096)]);
+        assert!(found[1].is_empty());
+
+        // Holding the write lock on `shadow.before` must serialize `find_all`
+        // until the writer finishes updating `before` and `data`.
+        let guard = shadow.before.write().unwrap();
+        let s2 = shadow.clone();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done2 = done.clone();
+        let handle = std::thread::spawn(move || {
+            let res = super::find_all(&[(s2, start as usize, start as usize + 4096)]);
+            done2.store(true, std::sync::atomic::Ordering::Release);
+            res
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            !done.load(std::sync::atomic::Ordering::Acquire),
+            "find_all must wait while a writer holds Shadow::before"
+        );
+        // Update `before` to match `data` before releasing the write lock;
+        // once unblocked, `find_all` must see the updated snapshot cleanly.
+        if let Some(before) = guard.as_ref() {
+            let _ = before;
+        }
+        let mut guard = guard;
+        guard.as_mut().unwrap()[64] = 0x99;
+        drop(guard);
+        let res = handle.join().unwrap();
+        assert!(res[0].is_empty(), "find_all must observe the post-write snapshot");
+    }
 }
 
 /// Snapshot memory kept for reuse (already touched, so no page faults).
@@ -1113,19 +1245,32 @@ fn copy_jobs(copies: Vec<(usize, usize, usize)>) -> Vec<Job> {
 /// not yet done), the 64 KiB pieces that differ from the snapshot, as
 /// [`Shadow::copy_back_with`] takes them; found on several threads.
 pub(crate) fn find_all(work: &[(Arc<Shadow>, usize, usize)]) -> Vec<Vec<(usize, usize)>> {
+    // Hold read locks on every unique Shadow's snapshot across `find_pieces`
+    // in deterministic pointer order so concurrent `merge_under_writes` or
+    // `copy_back_done` cannot mutate or free `before` / `self.data` while
+    // worker threads compare them.
+    let mut unique: Vec<&Arc<Shadow>> = work.iter().map(|(s, _, _)| s).collect();
+    unique.sort_unstable_by_key(|s| Arc::as_ptr(s) as usize);
+    unique.dedup_by_key(|s| Arc::as_ptr(s) as usize);
+    let guards: Vec<(usize, std::sync::RwLockReadGuard<'_, Option<Vec<u8>>>)> = unique
+        .into_iter()
+        .map(|s| (Arc::as_ptr(s) as usize, s.before.read().unwrap_or_else(|e| e.into_inner())))
+        .collect();
     let scans = work
         .iter()
         .map(|(shadow, address, end)| {
             let (from, to) = shadow.inside(*address, end.saturating_sub(*address));
-            // The snapshot's memory stays until the range is done with
-            // (`copy_back_done`), which comes after this.
-            match shadow.before.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            let key = Arc::as_ptr(shadow) as usize;
+            let i = guards.binary_search_by_key(&key, |&(k, _)| k).expect("shadow in guards");
+            match guards[i].1.as_ref() {
                 Some(before) => (shadow.data as usize, before.as_ptr() as usize, shadow.start as usize, from, to),
                 None => (0, 0, 0, 0, 0),
             }
         })
         .collect();
-    find_pieces(scans)
+    let found = find_pieces(scans);
+    drop(guards);
+    found
 }
 
 /// For each of `scans` (where a copy's bytes are, where its snapshot's
@@ -1721,7 +1866,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             flights: Mutex::default(),
-            before: Mutex::default(),
+            before: RwLock::default(),
             kept: Mutex::default(),
             used: AtomicU64::new(crate::host::moment()),
             asked: [AtomicU64::new(u64::MAX), AtomicU64::new(0)],
@@ -1820,7 +1965,7 @@ impl Shadow {
         let taken: usize = parts.iter().map(|&(from, to)| to.saturating_sub(from)).sum();
         BACK_CLASS[usize::from(!self.window)].fetch_add(taken as u64, Ordering::Relaxed);
         let total = self.len as usize;
-        let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut before = self.before.write().unwrap_or_else(|e| e.into_inner());
         let snapshot = before.get_or_insert_with(|| pooled(total));
         if keeps() {
             // Piece by piece, and only the pieces not known current. A
@@ -1895,7 +2040,7 @@ impl Shadow {
         if self.place.is_some() {
             return 0;
         }
-        let snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let snapshot = self.before.write().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
@@ -2017,7 +2162,7 @@ impl Shadow {
         if self.card.is_some() || n == 0 || at + n > self.len as usize {
             return 0;
         }
-        let mut snapshot = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let mut snapshot = self.before.write().unwrap_or_else(|e| e.into_inner());
         let Some(before) = snapshot.as_mut() else {
             return 0;
         };
@@ -2149,7 +2294,7 @@ impl Shadow {
             // the snapshot's.)
             kept.0.clear();
         }
-        if let Some(bytes) = self.before.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        if let Some(bytes) = self.before.write().unwrap_or_else(|e| e.into_inner()).take() {
             give_back(bytes);
         }
     }
@@ -2299,7 +2444,7 @@ impl Shadow {
                 // reference under the same lock, and a page read before
                 // such a merge and compared after it would take the card's
                 // bytes for the title's.
-                let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
+                let mut before = self.before.write().unwrap_or_else(|e| e.into_inner());
                 // A page that is not there is left as it is, and looked at
                 // again next time.
                 if !crate::host::read_into(lo as *const u8, title) {
@@ -2713,18 +2858,16 @@ impl Shadow {
         if at + gpu.len() > self.len as usize {
             return 0;
         }
-        let _side = self.before.lock().unwrap_or_else(|e| e.into_inner());
+        let _side = self.before.write().unwrap_or_else(|e| e.into_inner());
         // SAFETY: inside the mapping (checked above). The offsets are in a
         // range declared and not done with, which no refresh writes; what
         // does write it (the title's bytes put in under shader writes)
         // holds the lock held here.
         let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), gpu.len()) };
-        let Some(first) = first_difference(gpu, held) else {
+        if first_difference(gpu, held).is_none() {
             return 0;
-        };
-        let last = last_difference(gpu, held).unwrap_or(first);
-        let (at, n) = (at + first, last + 1 - first);
-        let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
+        }
+        let end = at + gpu.len();
         let skip: Vec<(usize, usize)> = {
             let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
             let sent = card.sent.lock().unwrap_or_else(|e| e.into_inner());
@@ -2732,26 +2875,67 @@ impl Shadow {
                 .iter()
                 .copied()
                 .chain(sent.iter().filter(|s| s.2 > fetched_after).map(|s| (s.0, s.1)))
-                .filter(|&(a, b)| a < at + n && b > at)
+                .filter(|&(a, b)| a < end && b > at)
                 .collect()
         };
-        title.clear();
-        title.resize(n, 0);
-        let mapped = crate::host::read_into((start + at) as *const u8, title);
-        let mut changed = false;
-        for (a, b) in outside(at, at + n, skip) {
-            let (a, b) = (a - at, b - at);
-            // Title memory that is not mapped: the CPU's side keeps what
-            // the card wrote, as before; `title` is scratch then.
-            changed |= merge_piece(&gpu[a..b], &mut held[a..b], &mut title[a..b]);
-        }
-        if !mapped || !changed {
-            return 0;
-        }
-        crate::watch::writing(start + at, n);
-        crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-        n
+        merge_card_relay_span(start, at, gpu, held, skip, title)
     }
+}
+
+/// Merges `gpu` into `held` and mapped title memory at `start + at` for
+/// every sub-range outside `skip`, trimming each sub-range to its differing
+/// bytes so skipped or untouched regions are never read or overwritten, and
+/// falling back to 4 KiB page granularity if a sub-range contains an
+/// unmapped page so neighboring mapped pages still receive their writes.
+fn merge_card_relay_span(
+    start: usize,
+    at: usize,
+    gpu: &[u8],
+    held: &mut [u8],
+    skip: Vec<(usize, usize)>,
+    title: &mut Vec<u8>,
+) -> usize {
+    let mut written = 0usize;
+    for (a, b) in outside(at, at + gpu.len(), skip) {
+        let (sub_gpu, sub_held) = (&gpu[a - at..b - at], &mut held[a - at..b - at]);
+        let Some(first) = first_difference(sub_gpu, sub_held) else {
+            continue;
+        };
+        let last = last_difference(sub_gpu, sub_held).unwrap_or(first);
+        let (sub_at, sub_n) = (a + first, last + 1 - first);
+        let (sub_gpu, sub_held) = (&sub_gpu[first..=last], &mut sub_held[first..=last]);
+        title.clear();
+        title.resize(sub_n, 0);
+        if crate::host::read_into((start + sub_at) as *const u8, title) {
+            if merge_piece(sub_gpu, sub_held, title) {
+                crate::watch::writing(start + sub_at, sub_n);
+                crate::host::write_mapped((start + sub_at) as *mut u8, title.as_ptr(), sub_n);
+                written += sub_n;
+            }
+        } else {
+            const OS_PAGE: usize = 4096;
+            let mut pos = 0usize;
+            while pos < sub_n {
+                let addr = start + sub_at + pos;
+                let chunk = (OS_PAGE - (addr % OS_PAGE)).min(sub_n - pos);
+                title.clear();
+                title.resize(chunk, 0);
+                let mapped = crate::host::read_into(addr as *const u8, title);
+                let changed = merge_piece(
+                    &sub_gpu[pos..pos + chunk],
+                    &mut sub_held[pos..pos + chunk],
+                    title,
+                );
+                if mapped && changed {
+                    crate::watch::writing(addr, chunk);
+                    crate::host::write_mapped(addr as *mut u8, title.as_ptr(), chunk);
+                    written += chunk;
+                }
+                pos += chunk;
+            }
+        }
+    }
+    written
 }
 
 struct Entry {
