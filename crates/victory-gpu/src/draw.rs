@@ -456,6 +456,7 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
+        list.buffer_read(&shadow.buffer);
         return Some(gpu);
     }
     let (gpu, to) = list.scratch(len)?;
@@ -861,6 +862,7 @@ impl State {
                 continue;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_read(&shadow.buffer);
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -879,6 +881,7 @@ impl State {
                 return false;
             };
             shadow.refresh(list, v.address, u64::from(v.size));
+            list.buffer_read(&shadow.buffer);
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -1176,6 +1179,7 @@ impl State {
         let ready = |a: u64, s: &std::sync::Arc<crate::shadow::Shadow>| {
             let len = s.left(a).min(limit);
             s.refresh(list, a, len);
+            list.buffer_uav(&s.buffer);
             if writes {
                 s.gpu_writes(list, a, len);
             }
@@ -1322,6 +1326,7 @@ impl State {
         // past it stale (most mesh vertex streams reach further).
         if let Some((a, s)) = &shadow {
             s.refresh(list, *a, s.left(*a));
+            list.buffer_read(&s.buffer);
         }
         let handle = host.gpu_handle(index);
         // SAFETY: an open list; the slot is in the bound view heap.
@@ -2948,8 +2953,10 @@ impl State {
                     _ => (stride, max),
                 };
                 args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
+                list.buffer_read(&args.buffer);
                 if let Some((s, at)) = &counter {
                     s.refresh(list, *at, 4);
+                    list.buffer_read(&s.buffer);
                 }
                 // Bounded first: the clamp binds a compute pipeline of its
                 // own and copies clamped active records into a scratch
@@ -2998,6 +3005,9 @@ impl State {
         });
         if kind == MESH {
             self.mesh_scissor(list, true);
+        }
+        if let Some((s, _)) = &counter {
+            list.buffer_read(&s.buffer);
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
@@ -3109,6 +3119,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
         shadow.refresh(list, address, len);
         if kind == ResourceType::Uav {
+            list.buffer_uav(&shadow.buffer);
             // A shader that cannot store to buffers leaves the range as
             // the title has it: nothing to find afterwards.
             if STORES.get() || !write_skip() {
@@ -3120,6 +3131,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
                     crate::copystat::add(crate::copystat::C::GpuWritesLeftOutBytes, len);
                 }
             }
+        } else {
+            list.buffer_read(&shadow.buffer);
         }
     }
     match (view, kind) {

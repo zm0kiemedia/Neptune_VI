@@ -764,6 +764,40 @@ mod tests {
     }
 }
 
+/// Per-list D3D12 state of `Shadow` buffers. Every `Shadow` buffer is created
+/// in `D3D12_RESOURCE_STATE_COMMON` and decays back to `COMMON` at the end of
+/// `ExecuteCommandLists`, so state tracking is strictly local to each list.
+#[derive(Default)]
+struct BufferStates {
+    /// Raw `ID3D12Resource` pointer -> `(current state, live handle)`.
+    /// Holding a clone keeps the COM address unique until `HostList::reset`.
+    entries: std::collections::HashMap<usize, (D3D12_RESOURCE_STATES, ID3D12Resource)>,
+}
+
+impl BufferStates {
+    fn transition_for(
+        &mut self,
+        buffer: &ID3D12Resource,
+        wanted: D3D12_RESOURCE_STATES,
+    ) -> Option<D3D12_RESOURCE_STATES> {
+        let key = buffer.as_raw() as usize;
+        match self.entries.entry(key) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, buffer.clone()));
+                (wanted != D3D12_RESOURCE_STATE_COMMON).then_some(D3D12_RESOURCE_STATE_COMMON)
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().0, wanted);
+                (before != wanted).then_some(before)
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 /// A host command list and its allocator, always used together.
 pub(crate) struct HostList {
     allocator: ID3D12CommandAllocator,
@@ -780,6 +814,9 @@ pub(crate) struct HostList {
     /// list names alive until it is reset, even if the title releases the
     /// resource first.
     states: Mutex<States>,
+    /// Per-list D3D12 state of `Shadow` buffers (`COMMON` at list start,
+    /// decaying back to `COMMON` when `ExecuteCommandLists` finishes).
+    buffer_states: Mutex<BufferStates>,
     /// What the list does with depth textures that have a colour twin, by
     /// twin ([`TwinUse`]).
     twins: Mutex<std::collections::HashMap<usize, TwinUse>>,
@@ -2936,6 +2973,7 @@ impl Host {
                 deferred: Mutex::default(),
                 scratch: Mutex::default(),
                 states: Mutex::default(),
+                buffer_states: Mutex::default(),
                 twins: Mutex::default(),
                 prelude,
                 pipelines: Mutex::default(),
@@ -4544,6 +4582,7 @@ impl HostList {
         self._alive.used();
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.buffer_states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
@@ -4568,6 +4607,43 @@ impl HostList {
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// Moves a `Shadow` buffer (created in `COMMON`) to `wanted`
+    /// (`GENERIC_READ` or `UNORDERED_ACCESS`) in this list and records the
+    /// transition barrier when its state changes. Buffers always decay back
+    /// to `COMMON` at the end of `ExecuteCommandLists`, so no prelude is
+    /// needed.
+    pub(crate) fn buffer_state(&self, buffer: &ID3D12Resource, wanted: D3D12_RESOURCE_STATES) {
+        if wanted == D3D12_RESOURCE_STATE_UNORDERED_ACCESS {
+            // SAFETY: a live buffer.
+            let flags = unsafe { buffer.GetDesc() }.Flags;
+            if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
+                return;
+            }
+        }
+        let before = self
+            .buffer_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .transition_for(buffer, wanted);
+        if let Some(before) = before {
+            let barrier = transition(buffer, before, wanted);
+            // SAFETY: an open direct command list and a live buffer.
+            unsafe { self.list.ResourceBarrier(&[barrier]) };
+        }
+    }
+
+    /// Transitions a `Shadow` buffer to `GENERIC_READ` (VB, IB, CBV, SRV,
+    /// indirect argument) if it is not already there in this list.
+    pub(crate) fn buffer_read(&self, buffer: &ID3D12Resource) {
+        self.buffer_state(buffer, D3D12_RESOURCE_STATE_GENERIC_READ);
+    }
+
+    /// Transitions a `Shadow` buffer to `UNORDERED_ACCESS` if it is not
+    /// already there in this list.
+    pub(crate) fn buffer_uav(&self, buffer: &ID3D12Resource) {
+        self.buffer_state(buffer, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     }
 
     /// Moves a title texture's host copy to `wanted` (a host state) in this
@@ -6701,5 +6777,167 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    #[test]
+    fn buffer_states_track_transitions_and_execute_on_d3d12() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_UINT, DXGI_SAMPLE_DESC};
+        use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter, IDXGIFactory4};
+        use windows::core::Interface;
+
+        // Enable D3D12 debug layer when installed so invalid barriers fail the test.
+        let mut debug: Option<ID3D12Debug> = None;
+        let _ = unsafe { D3D12GetDebugInterface(&mut debug) };
+        if let Some(d) = &debug {
+            unsafe { d.EnableDebugLayer() };
+        }
+
+        let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }.unwrap();
+        let adapter: IDXGIAdapter = unsafe { factory.EnumWarpAdapter() }.unwrap();
+        let mut device: Option<ID3D12Device> = None;
+        unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device) }.unwrap();
+        let device = device.unwrap();
+        let info_queue: Option<ID3D12InfoQueue> = device.cast().ok();
+
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+            ..Default::default()
+        };
+        let mut buf: Option<ID3D12Resource> = None;
+        unsafe {
+            device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buf,
+            )
+        }
+        .unwrap();
+        let buf = buf.unwrap();
+
+        // 1. State-machine transitions and reset back to COMMON.
+        let mut states = super::BufferStates::default();
+        assert_eq!(
+            states.transition_for(&buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            Some(D3D12_RESOURCE_STATE_COMMON)
+        );
+        assert_eq!(states.transition_for(&buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS), None);
+        assert_eq!(
+            states.transition_for(&buf, D3D12_RESOURCE_STATE_GENERIC_READ),
+            Some(D3D12_RESOURCE_STATE_UNORDERED_ACCESS)
+        );
+        assert_eq!(states.transition_for(&buf, D3D12_RESOURCE_STATE_GENERIC_READ), None);
+        assert_eq!(
+            states.transition_for(&buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            Some(D3D12_RESOURCE_STATE_GENERIC_READ)
+        );
+        states.clear();
+        assert_eq!(
+            states.transition_for(&buf, D3D12_RESOURCE_STATE_GENERIC_READ),
+            Some(D3D12_RESOURCE_STATE_COMMON)
+        );
+
+        // 2. Real D3D12 command list: UAV -> GENERIC_READ -> VB/IB -> UAV across two submissions.
+        let queue_desc = D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+            ..Default::default()
+        };
+        let queue: ID3D12CommandQueue = unsafe { device.CreateCommandQueue(&queue_desc) }.unwrap();
+        let allocator: ID3D12CommandAllocator =
+            unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }.unwrap();
+        let cmd: ID3D12GraphicsCommandList = unsafe {
+            device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
+        }
+        .unwrap();
+        let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        let gpu_va = unsafe { buf.GetGPUVirtualAddress() };
+
+        for pass in 1u64..=2 {
+            let mut bs = super::BufferStates::default();
+            for wanted in [
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+            ] {
+                if let Some(before) = bs.transition_for(&buf, wanted) {
+                    let barrier = super::transition(&buf, before, wanted);
+                    unsafe { cmd.ResourceBarrier(&[barrier]) };
+                }
+            }
+            let vbv = D3D12_VERTEX_BUFFER_VIEW {
+                BufferLocation: gpu_va,
+                SizeInBytes: 128,
+                StrideInBytes: 16,
+            };
+            let ibv = D3D12_INDEX_BUFFER_VIEW {
+                BufferLocation: gpu_va + 128,
+                SizeInBytes: 128,
+                Format: DXGI_FORMAT_R32_UINT,
+            };
+            unsafe {
+                cmd.IASetVertexBuffers(0, Some(&[vbv]));
+                cmd.IASetIndexBuffer(Some(&ibv));
+            }
+            if let Some(before) = bs.transition_for(&buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+                let barrier = super::transition(&buf, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                unsafe { cmd.ResourceBarrier(&[barrier]) };
+            }
+            unsafe { cmd.Close() }.unwrap();
+            let list_ref: ID3D12CommandList = cmd.cast().unwrap();
+            unsafe { queue.ExecuteCommandLists(&[Some(list_ref)]) };
+            unsafe { queue.Signal(&fence, pass) }.unwrap();
+            while unsafe { fence.GetCompletedValue() } < pass {
+                std::thread::yield_now();
+            }
+            if pass == 1 {
+                unsafe {
+                    allocator.Reset().unwrap();
+                    cmd.Reset(&allocator, None).unwrap();
+                }
+            }
+        }
+        assert_eq!(unsafe { device.GetDeviceRemovedReason() }, Ok(()));
+        if let Some(q) = info_queue {
+            let n = unsafe { q.GetNumStoredMessages() };
+            let mut errors = Vec::new();
+            for i in 0..n {
+                let mut len = 0usize;
+                let _ = unsafe { q.GetMessage(i, None, &mut len) };
+                if len == 0 {
+                    continue;
+                }
+                let mut raw = vec![0u8; len];
+                let msg = raw.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                if unsafe { q.GetMessage(i, Some(msg), &mut len) }.is_ok() {
+                    let m = unsafe { &*msg };
+                    if m.Severity == D3D12_MESSAGE_SEVERITY_ERROR
+                        || m.Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION
+                    {
+                        let text = unsafe {
+                            std::slice::from_raw_parts(
+                                m.pDescription,
+                                m.DescriptionByteLength.saturating_sub(1),
+                            )
+                        };
+                        errors.push(String::from_utf8_lossy(text).into_owned());
+                    }
+                }
+            }
+            assert!(errors.is_empty(), "D3D12 debug errors: {errors:?}");
+        }
     }
 }
