@@ -1261,7 +1261,7 @@ fn record_twin_copy(
 pub(crate) fn dred_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| {
-        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some()
+        cfg!(feature = "diagnostics") && std::env::var_os("VICTORY_D3D12_DRED").is_some_and(|v| v != "0")
     })
 }
 
