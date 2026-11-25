@@ -1667,6 +1667,8 @@ enum Step {
 /// the upload buffers its GPU commands read, kept until the list is reset.
 #[derive(Default)]
 struct Deferred {
+    /// A window may be reused across draws until recorded work can change its inputs.
+    indirect_window: bool,
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
@@ -2617,6 +2619,21 @@ fn late_line(frames: f64) {
 #[cfg(test)]
 mod late_tests {
     use super::{continues, join_ranges, touches};
+
+    #[test]
+    fn indirect_window_ends_at_a_copy_or_unknown_writer() {
+        let list = super::host().unwrap().new_list().unwrap();
+        assert!(list.new_indirect_window());
+        assert!(!list.new_indirect_window());
+        // Recording the steps does not dereference the synthetic addresses.
+        list.defer_copy(0x4000 as *mut u8, 0x6000 as *const u8, 4);
+        assert!(list.new_indirect_window());
+        list.defer_copy(0x4004 as *mut u8, 0x6004 as *const u8, 4);
+        assert!(list.new_indirect_window());
+        list.defer(|| {});
+        assert!(list.new_indirect_window());
+        assert!(!list.new_indirect_window());
+    }
 
     /// Copies join only when both ends continue and the whole does not
     /// overlap itself.
@@ -5044,6 +5061,7 @@ impl HostList {
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
+        deferred.indirect_window = false;
         COPIES_JOINED[0].fetch_add(1, Ordering::Relaxed);
         // A copy that goes on where the one recorded just before it ended,
         // source and destination both: with `join_copies` the two are one
@@ -5097,7 +5115,9 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
+        let mut deferred = self.deferred();
+        deferred.indirect_window = false;
+        deferred
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
@@ -5234,6 +5254,10 @@ impl HostList {
         }
     }
 
+    pub(crate) fn new_indirect_window(&self) -> bool {
+        !std::mem::replace(&mut self.deferred().indirect_window, true)
+    }
+
     /// Whether this is the first time since the reset that the list asks
     /// about `key` (a texture to bring up to date).
     pub(crate) fn first_use(&self, key: usize) -> bool {
@@ -5243,8 +5267,10 @@ impl HostList {
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        self.deferred().copies.push(Step::Run(Box::new(work)));
-        self.deferred().refreshed.clear();
+        let mut deferred = self.deferred();
+        deferred.indirect_window = false;
+        deferred.copies.push(Step::Run(Box::new(work)));
+        deferred.refreshed.clear();
     }
 
     /// As [`HostList::defer`], for work that writes only host memory.
