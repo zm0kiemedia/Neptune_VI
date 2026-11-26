@@ -191,14 +191,18 @@ fn make() -> windows::core::Result<Clamp> {
 }
 
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    make_from(device, SOURCE, s!("clamp"))
+}
+
+fn make_from(device: &ID3D12Device, source: &str, name: windows::core::PCSTR) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
-            s!("clamp"),
+            source.as_ptr().cast(),
+            source.len(),
+            name,
             None,
             None,
             s!("main"),
@@ -302,6 +306,196 @@ pub(crate) fn bound_ahead(
     let bytes = validate_layout(spec, src.1, None)?;
     let (c, budget, dst) = (clamp()?, list.budget()?, list.indirect_scratch(bytes)?);
     record_clamp_as(c, &list.list, &dst, budget, src, None, spec, AHEAD).then_some(dst)
+}
+
+/// (Neptune) `VICTORY_CLAMP_AFTER_WRITER=1` (off by default): a single indirect record that an
+/// earlier shader of its list may write is not clamped by a pass of its own. A pass of ours
+/// ([`sanitized`]) rewrites, in place in the title's buffer, every record of the records the
+/// title has read as arguments (learned in this and the last two frames) that overlaps a range
+/// shaders of the list declared written since the buffer's last pass, and the draw executes
+/// the record raw. The pass runs at the first reader after the writers, not at each writer:
+/// any number of writers before it share one pass.
+pub(crate) fn after_writer() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_AFTER_WRITER").is_some_and(|v| v == "1"))
+}
+
+/// Since the last frame line: sanitize passes, records they covered, records they made empty
+/// (counted on the card, taken at a later submission), readers run raw, readers that fell back.
+pub(crate) static SAN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Records the title read as arguments (single, no count): title address to kind and the frame
+/// of the last read, kept two frames.
+static LEARNED: std::sync::Mutex<(u64, std::collections::BTreeMap<usize, (u32, u64)>)> =
+    std::sync::Mutex::new((0, std::collections::BTreeMap::new()));
+
+/// Notes a single record of `kind` the title reads at `at`.
+pub(crate) fn learn(at: usize, kind: u32) {
+    let frame = crate::frame::current();
+    let mut learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if learned.0 != frame {
+        learned.0 = frame;
+        learned.1.retain(|_, v| v.1 + 2 >= frame);
+    }
+    learned.1.insert(at, (kind, frame));
+}
+
+/// What a list knows of its records: the writes it declared (range, with the order number of
+/// its latest declaration), the order number of each copy's last pass (by [`Shadow::id`]), and
+/// the records that pass covered (kind and order number). A record is clean when no write
+/// that overlaps it was declared after the pass that covered it.
+#[derive(Default)]
+pub(crate) struct San {
+    seq: u64,
+    writes: std::collections::HashMap<(usize, usize), u64>,
+    passed: std::collections::HashMap<u64, u64>,
+    clean: std::collections::HashMap<usize, (u32, u64)>,
+}
+
+impl San {
+    /// Shaders of the list write `[from, to)` from here on.
+    pub(crate) fn wrote(&mut self, from: usize, to: usize) {
+        self.seq += 1;
+        self.writes.insert((from, to), self.seq);
+    }
+
+    fn is_clean(&self, at: usize, kind: u32, size: usize) -> bool {
+        self.clean.get(&at).is_some_and(|&(k, s)| {
+            k == kind && !self.writes.iter().any(|(&(from, to), &w)| w > s && from < at + size && at < to)
+        })
+    }
+}
+
+const SANITIZE: &str = r#"
+#define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), UAV(u0), UAV(u1)"
+cbuffer Pass : register(b0) { uint records; };
+// Per record: byte offset in `args`, kind (0 draw, 1 indexed, else mesh).
+ByteAddressBuffer table : register(t0);
+RWByteAddressBuffer args : register(u0);
+// The list's note words: word 5 counts the records made empty.
+RWByteAddressBuffer note : register(u1);
+[RootSignature(RS)]
+[numthreads(64, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= records) return;
+    uint2 e = table.Load2(id.x * 8);
+    bool bad;
+    if (e.y <= 1) {
+        uint2 v = args.Load2(e.x);
+        bad = v.x > (1u << 24) || v.y > (1u << 24) || (v.y != 0 && v.x > (1u << 26) / v.y);
+        if (bad) args.Store2(e.x, uint2(0, 0));
+    } else {
+        uint3 g = args.Load3(e.x);
+        bad = g.x > 65535u || g.y > 65535u || g.z > 65535u;
+        if (!bad && g.z != 0) bad = g.x * g.y > (1u << 22) / g.z;
+        if (bad) args.Store3(e.x, uint3(0, 0, 0));
+    }
+    if (bad) {
+        uint was;
+        note.InterlockedAdd(20, 1u, was);
+    }
+}
+"#;
+
+fn sanitizer() -> Option<&'static Clamp> {
+    static S: std::sync::OnceLock<Option<Clamp>> = std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        let device = &host()?.device;
+        make_from(device, SANITIZE, s!("sanitize")).map_err(|e| tracing::warn!(error = %e, "no argument sanitizer")).ok()
+    })
+    .as_ref()
+}
+
+/// Makes the record of `kind` (0, 1 or 10) at title address `at` of `args` safe to execute raw
+/// in `list`: clean already, or after a pass that rewrites out-of-range records (more than 2^24
+/// vertices or instances, more than 2^26 vertex instances, more than 65,535 mesh groups in a
+/// dimension or 2^22 in all) as empty, in place. Returns (safe, a pass was recorded: the
+/// list's compute pipeline and root signature are ours now). Not safe: the caller clamps.
+pub(crate) fn sanitized(list: &HostList, args: &crate::shadow::Shadow, at: u64, kind: u32) -> (bool, bool) {
+    let Some(size) = min_stride(kind) else { return (false, false) };
+    if list.with_san(|s| s.is_clean(at as usize, kind, size as usize)) {
+        return (true, false);
+    }
+    let ran = pass(list, args, at, kind);
+    (ran.is_some(), ran.is_some())
+}
+
+fn pass(list: &HostList, args: &crate::shadow::Shadow, at: u64, kind: u32) -> Option<()> {
+    /// The most records of one pass (others stay unclean and are clamped).
+    const MOST: usize = 1 << 15;
+    let (c, budget) = (sanitizer()?, list.budget()?);
+    let (start, len) = args.span();
+    let (lo, hi) = (start as usize, (start + len) as usize);
+    let (seq, ranges) = list.with_san(|s| {
+        let marker = s.passed.get(&args.id()).copied().unwrap_or(0);
+        let ranges: Vec<(usize, usize)> = s
+            .writes
+            .iter()
+            .filter(|&(&(from, to), &w)| w > marker && from < hi && lo < to)
+            .map(|(&(from, to), _)| (from.max(lo), to.min(hi)))
+            .collect();
+        (s.seq, ranges)
+    });
+    // The reader's own record always, and the learned ones in what was written since.
+    let mut records = std::collections::HashMap::new();
+    {
+        let learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
+        for (from, to) in ranges {
+            for (&a, &(k, _)) in learned.1.range(from..to) {
+                if records.len() < MOST {
+                    records.insert(a, k);
+                }
+            }
+        }
+    }
+    records.insert(at as usize, kind);
+    let mut table: Vec<[u32; 2]> = Vec::with_capacity(records.len());
+    let mut taken: Vec<(usize, u32)> = Vec::with_capacity(records.len());
+    for (&a, &k) in &records {
+        let size = min_stride(k)?;
+        let off = args.offset(a as u64);
+        if a < lo || a + size as usize > hi || !off.is_multiple_of(4) || off + u64::from(size) > u64::from(u32::MAX) {
+            // The reader's own record must pass; a learned one may just stay unclean.
+            if a == at as usize {
+                return None;
+            }
+            continue;
+        }
+        table.push([off as u32, if k <= 1 { k } else { 10 }]);
+        taken.push((a, k));
+    }
+    // SAFETY: a live buffer.
+    let buffer = unsafe { args.buffer.GetGPUVirtualAddress() };
+    if !buffer.is_multiple_of(4) || !budget.is_multiple_of(4) {
+        return None;
+    }
+    let (gpu, ptr) = list.scratch(table.len() as u64 * 8)?;
+    let n = table.len() as u32;
+    // SAFETY: the list's own upload memory, `n` entries of 8 bytes; an open list; our root
+    // signature and pipeline; a live buffer of the title's copy, which shaders of the list
+    // write the same way. Earlier writes are waited for before, ours before the draw reads.
+    unsafe {
+        std::ptr::copy_nonoverlapping(table.as_ptr().cast::<u8>(), ptr, table.len() * 8);
+        let l = &list.list;
+        l.ResourceBarrier(&[uav_barrier()]);
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 1, (&raw const n).cast(), 0);
+        l.SetComputeRootShaderResourceView(1, gpu);
+        l.SetComputeRootUnorderedAccessView(2, buffer);
+        l.SetComputeRootUnorderedAccessView(3, budget);
+        l.Dispatch(n.div_ceil(64), 1, 1);
+        l.ResourceBarrier(&[uav_barrier()]);
+    }
+    list.with_san(|s| {
+        s.passed.insert(args.id(), seq);
+        for (a, k) in taken {
+            s.clean.insert(a, (k, seq));
+        }
+    });
+    SAN[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SAN[1].fetch_add(u64::from(n), std::sync::atomic::Ordering::Relaxed);
+    Some(())
 }
 
 /// The parts [`bound_split`] makes of a dispatch, the most groups of each,

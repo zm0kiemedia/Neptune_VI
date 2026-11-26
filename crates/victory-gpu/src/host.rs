@@ -2536,6 +2536,8 @@ struct Deferred {
     /// (Neptune) Title memory the list's shaders may write, as declared so
     /// far ([`HostList::defer_gpu_write`]): start and end.
     gpu_ranges: Vec<(usize, usize)>,
+    /// (Neptune) What the list knows of its indirect records' safety (`VICTORY_CLAMP_AFTER_WRITER`).
+    san: crate::indirect::San,
     /// Work once the list has run (diagnostics: what read-back buffers
     /// hold, `HostList::defer_after`).
     #[cfg(feature = "diagnostics")]
@@ -7269,6 +7271,11 @@ impl HostList {
         self.used_pipeline(name);
     }
 
+    /// (Neptune) The list's record of which indirect records are clean (`crate::indirect::San`).
+    pub(crate) fn with_san<R>(&self, f: impl FnOnce(&mut crate::indirect::San) -> R) -> R {
+        f(&mut self.deferred().san)
+    }
+
     /// (Neptune) Whether shaders of the list, as recorded so far, may write
     /// title memory in `[address, address + len)`.
     pub(crate) fn gpu_written(&self, address: usize, len: usize) -> bool {
@@ -7422,7 +7429,9 @@ impl HostList {
                 let (widest, cut) = (words.add(3).read_volatile(), words.add(4).read_volatile());
                 COMPUTE_GROUPS[0].fetch_max(u64::from(widest), Ordering::Relaxed);
                 COMPUTE_GROUPS[1].fetch_add(u64::from(cut), Ordering::Relaxed);
-                for k in 0..5 {
+                // And the records the sanitizer made empty.
+                crate::indirect::SAN[2].fetch_add(u64::from(words.add(5).read_volatile()), Ordering::Relaxed);
+                for k in 0..6 {
                     words.add(k).write_volatile(0);
                 }
             })));
@@ -8397,6 +8406,12 @@ impl Meter {
             tracing::info!(
                 "indirect records per frame: {ahead:.0} clamped ahead in their lists' preludes, {in_place:.0} clamped in place (VICTORY_CLAMP_AHEAD=0: all in place), {raw:.0} drawn as the title wrote them (VICTORY_INDIRECT_RAW=2)"
             );
+            let [passes, covered, empty, raw, fell] = [0, 1, 2, 3, 4].map(|i| crate::indirect::SAN[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if passes + raw + fell > 0.0 {
+                tracing::info!(
+                    "sanitize after writers per frame (VICTORY_CLAMP_AFTER_WRITER=1): {passes:.0} passes over {covered:.0} records, {empty:.0} made empty; readers: {raw:.0} run raw, {fell:.0} fell back to the clamp"
+                );
+            }
             let [dispatches, covered] = [3, 4].map(|i| crate::draw::CLAMPS[i].swap(0, Ordering::Relaxed) as f64);
             tracing::info!(
                 "in-place clamp dispatches per frame: {:.0}, {:.1} records each (VICTORY_CLAMP_BATCH=1 batches them in windows; off: one record per dispatch)",

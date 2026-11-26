@@ -3579,6 +3579,9 @@ impl State {
             why("arguments outside title buffers");
             return false;
         };
+        if crate::indirect::after_writer() && matches!(kind, DRAW | INDEXED | MESH) && max == 1 && count.is_none() {
+            crate::indirect::learn(arguments as usize, kind);
+        }
         let counter = match count {
             Some(at) => match crate::shadow::find_any(at, 4) {
                 Some(s) => Some((s, at)),
@@ -3648,7 +3651,26 @@ impl State {
             RAW3[slot].fetch_add(1, Ordering::Relaxed);
             slot == 0
         };
-        if (raw_all() || trusted) && matches!(kind, DRAW | INDEXED | MESH | DISPATCH) && !split {
+        // (Neptune) `VICTORY_CLAMP_AFTER_WRITER=1`: a single record that shaders of the list write
+        // runs raw once a pass of ours has made it safe in place (`crate::indirect::sanitized`);
+        // when none can, it is clamped as before.
+        let after_writer = crate::indirect::after_writer()
+            && matches!(kind, DRAW | INDEXED | MESH)
+            && max == 1
+            && count.is_none()
+            && list.gpu_written(arguments as usize, len as usize)
+            && {
+                args.refresh(list, arguments, len);
+                let (safe, ran) = crate::indirect::sanitized(list, &args, arguments, kind);
+                if ran {
+                    // The pass bound a compute pipeline and root signature of its own.
+                    self.host_pipeline = 0;
+                    self.host_roots[1] = 0;
+                }
+                crate::indirect::SAN[if safe { 3 } else { 4 }].fetch_add(1, Ordering::Relaxed);
+                safe
+            };
+        if (raw_all() || trusted || after_writer) && matches!(kind, DRAW | INDEXED | MESH | DISPATCH) && !split {
             self.window = None;
             args.refresh(list, arguments, len);
             if let Some((s, at)) = &counter {
