@@ -8411,6 +8411,11 @@ impl Meter {
                 tracing::info!(
                     "sanitize after writers per frame (VICTORY_CLAMP_AFTER_WRITER=1): {passes:.0} passes over {covered:.0} records, {empty:.0} made empty; readers: {raw:.0} run raw, {fell:.0} fell back to the clamp"
                 );
+                let w = [0, 1, 2, 3, 4, 5, 6, 7].map(|i| crate::indirect::WHY[i].swap(0, Ordering::Relaxed) as f64 / frames);
+                tracing::info!(
+                    "  fallback reasons per frame: {:.0} records seen first time, {:.0} not written in their list, no pass possible: {:.0} no sanitizer, {:.0} no budget buffer, {:.0} record outside copy/misaligned/over u32, {:.0} copy address misaligned, {:.0} no scratch; {:.0} pass done but record not clean",
+                    w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]
+                );
             }
             let [dispatches, covered] = [3, 4].map(|i| crate::draw::CLAMPS[i].swap(0, Ordering::Relaxed) as f64);
             tracing::info!(

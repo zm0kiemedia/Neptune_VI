@@ -324,6 +324,12 @@ pub(crate) fn after_writer() -> bool {
 /// (counted on the card, taken at a later submission), readers run raw, readers that fell back.
 pub(crate) static SAN: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Why readers did not run raw: [0] a record seen for the first time (not learned before),
+/// [1] not written by shaders of its list, [2..7] no pass possible (no sanitizer, no budget
+/// buffer, record outside the copy or misaligned or offset over u32, copy's address
+/// misaligned, no scratch), [7] pass done but record not clean.
+pub(crate) static WHY: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
 /// Records the title read as arguments (single, no count): title address to kind and the frame
 /// of the last read, kept two frames.
 static LEARNED: std::sync::Mutex<(u64, std::collections::BTreeMap<usize, (u32, u64)>)> =
@@ -331,6 +337,10 @@ static LEARNED: std::sync::Mutex<(u64, std::collections::BTreeMap<usize, (u32, u
 
 /// Notes a single record of `kind` the title reads at `at`.
 pub(crate) fn learn(at: usize, kind: u32) {
+    let known = LEARNED.lock().unwrap_or_else(|e| e.into_inner()).1.contains_key(&at);
+    if !known {
+        WHY[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let frame = crate::frame::current();
     let mut learned = LEARNED.lock().unwrap_or_else(|e| e.into_inner());
     if learned.0 != frame {
@@ -359,6 +369,11 @@ impl San {
         self.writes.insert((from, to), self.seq);
     }
 
+    /// Up to 8 declared write ranges, for the log.
+    pub(crate) fn ranges(&self) -> Vec<(usize, usize)> {
+        self.writes.keys().copied().take(8).collect()
+    }
+
     fn is_clean(&self, at: usize, kind: u32, size: usize) -> bool {
         self.clean.get(&at).is_some_and(|&(k, s)| {
             k == kind && !self.writes.iter().any(|(&(from, to), &w)| w > s && from < at + size && at < to)
@@ -368,7 +383,7 @@ impl San {
 
 const SANITIZE: &str = r#"
 #define RS "RootConstants(num32BitConstants=1, b0), SRV(t0), UAV(u0), UAV(u1)"
-cbuffer Pass : register(b0) { uint records; };
+cbuffer Sweep : register(b0) { uint records; };
 // Per record: byte offset in `args`, kind (0 draw, 1 indexed, else mesh).
 ByteAddressBuffer table : register(t0);
 RWByteAddressBuffer args : register(u0);
@@ -417,13 +432,26 @@ pub(crate) fn sanitized(list: &HostList, args: &crate::shadow::Shadow, at: u64, 
         return (true, false);
     }
     let ran = pass(list, args, at, kind);
-    (ran.is_some(), ran.is_some())
+    let why = std::sync::atomic::Ordering::Relaxed;
+    match ran {
+        Err(i) => {
+            WHY[2 + i].fetch_add(1, why);
+            (false, false)
+        }
+        Ok(()) if !list.with_san(|s| s.is_clean(at as usize, kind, size as usize)) => {
+            WHY[7].fetch_add(1, why);
+            (false, true)
+        }
+        Ok(()) => (true, true),
+    }
 }
 
-fn pass(list: &HostList, args: &crate::shadow::Shadow, at: u64, kind: u32) -> Option<()> {
+/// `Err`: the index of the reason (see [`WHY`], from 2).
+fn pass(list: &HostList, args: &crate::shadow::Shadow, at: u64, kind: u32) -> Result<(), usize> {
     /// The most records of one pass (others stay unclean and are clamped).
     const MOST: usize = 1 << 15;
-    let (c, budget) = (sanitizer()?, list.budget()?);
+    let c = sanitizer().ok_or(0usize)?;
+    let budget = list.budget().ok_or(1usize)?;
     let (start, len) = args.span();
     let (lo, hi) = (start as usize, (start + len) as usize);
     let (seq, ranges) = list.with_san(|s| {
@@ -452,12 +480,12 @@ fn pass(list: &HostList, args: &crate::shadow::Shadow, at: u64, kind: u32) -> Op
     let mut table: Vec<[u32; 2]> = Vec::with_capacity(records.len());
     let mut taken: Vec<(usize, u32)> = Vec::with_capacity(records.len());
     for (&a, &k) in &records {
-        let size = min_stride(k)?;
+        let size = min_stride(k).ok_or(2usize)?;
         let off = args.offset(a as u64);
         if a < lo || a + size as usize > hi || !off.is_multiple_of(4) || off + u64::from(size) > u64::from(u32::MAX) {
             // The reader's own record must pass; a learned one may just stay unclean.
             if a == at as usize {
-                return None;
+                return Err(2);
             }
             continue;
         }
@@ -467,9 +495,9 @@ fn pass(list: &HostList, args: &crate::shadow::Shadow, at: u64, kind: u32) -> Op
     // SAFETY: a live buffer.
     let buffer = unsafe { args.buffer.GetGPUVirtualAddress() };
     if !buffer.is_multiple_of(4) || !budget.is_multiple_of(4) {
-        return None;
+        return Err(3);
     }
-    let (gpu, ptr) = list.scratch(table.len() as u64 * 8)?;
+    let (gpu, ptr) = list.scratch(table.len() as u64 * 8).ok_or(4usize)?;
     let n = table.len() as u32;
     // SAFETY: the list's own upload memory, `n` entries of 8 bytes; an open list; our root
     // signature and pipeline; a live buffer of the title's copy, which shaders of the list
@@ -495,7 +523,7 @@ fn pass(list: &HostList, args: &crate::shadow::Shadow, at: u64, kind: u32) -> Op
     });
     SAN[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     SAN[1].fetch_add(u64::from(n), std::sync::atomic::Ordering::Relaxed);
-    Some(())
+    Ok(())
 }
 
 /// The parts [`bound_split`] makes of a dispatch, the most groups of each,
