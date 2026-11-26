@@ -20,7 +20,7 @@
 
 Upstream froze the GPU right before the first gameplay scene on a Ryzen 7 9800X3D with an RTX 5070 Ti. The cause: the game's indirect draw arguments ran unchecked, and some of them hold garbage.
 
-This port checks every such record on the CPU first. Sane records run as fast as before, broken ones go through the safe path. **The game now gets into gameplay.**
+This port sanitizes those records once, right after the GPU work that writes them, and then lets the draws run directly. Broken records become empty draws instead of hanging the GPU. **The game gets into gameplay, at the same speed as the unchecked mode** (4.6 fps with per-draw checks, 8.4 fps with this, measured at one save).
 
 <br>
 
@@ -29,7 +29,8 @@ This port checks every such record on the CPU first. Sane records run as fast as
 | | |
 |:--|:--|
 | **Console instructions** | The Xbox CPU is a Zen 2. Instructions Intel lacks (`MONITORX`, `MWAITX`, `CLZERO`, `INSERTQ`) have to be emulated on Intel. A Ryzen has them in hardware. |
-| **Indirect draws** | `VICTORY_INDIRECT_RAW=3` is the default: argument records are checked on the CPU before the GPU runs them. `-RawIndirect` brings back upstream's mode. |
+| **Indirect draws** | `VICTORY_CLAMP_AFTER_WRITER=1` + `VICTORY_INDIRECT_RAW=3` are the default: argument records are sanitized once after the GPU writes them, then run raw. `-RawIndirect` brings back upstream's unchecked mode. |
+| **Black sky frames** | Fixed: a replaced texture keeps showing until its new version is uploaded. |
 | **Water physics** | On by default: the ocean's height maps are copied back into game memory, so boats float and you can swim. `-NoOcean` turns it off. |
 | **32 GB RAM** | Upstream was tuned on 64 GB. `-Ram32` shrinks the list pool, the texture staging and the card copies. |
 
@@ -85,6 +86,7 @@ Replace `D:\GTA6\...` with the path to **your** `game_scarlett_master.exe`.
 | `-Ram32` | smaller buffers for PCs with **32 GB** RAM (leave it out on 64 GB) |
 | `-Stats -Tag x` | writes `statsx.log` and `memwatchx.csv` next to the script, handy for bug reports |
 | `-Dred` | if the GPU hangs, the log names the shader that caused it |
+| `-GpuTime` | logs the 25 most expensive GPU passes every 5 s |
 | `-NoAutoA` | do not tap A through the start screens automatically |
 | `-NoOcean` | turn off the water physics fix (boats sink) |
 | `-Env 'NAME=value;...'` | any extra `VICTORY_*` setting |
