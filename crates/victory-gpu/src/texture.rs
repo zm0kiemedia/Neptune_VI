@@ -272,6 +272,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         D3D12_RESOURCE_STATE_COPY_DEST,
     );
     list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
+    list.gpu_stamp("texture alias copy", 0, 0);
     // SAFETY: an open list and live resources; the buffer is as big as
     // the footprints and rests in the common state between copies.
     unsafe {
@@ -781,6 +782,7 @@ pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resou
                 PlacedFootprint: *footprint,
             },
         };
+        list.gpu_stamp("texture upload", 0, u64::from(footprint.Footprint.RowPitch) * u64::from(staging.rows[i]));
         // SAFETY: an open list; both locations name live resources.
         unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
@@ -904,6 +906,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
                 Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                 Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
             };
+            list.gpu_stamp("texture catch-up", 0, bytes);
             // SAFETY: an open list; both locations name live resources.
             unsafe { list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
         }

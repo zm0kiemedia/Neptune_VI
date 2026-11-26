@@ -37,7 +37,8 @@ param(
   [string]$Env = '',                               # zm0kie: extra variables 'NAME=value;NAME2=value'
   [switch]$Dred,                                   # zm0kie: device-removed report (DRED breadcrumbs, page fault, per-command pipeline hashes)
   [switch]$NoOcean,                                # zm0kie: no ocean read-back (boats sink, no swimming)
-  [switch]$RawIndirect                             # zm0kie: VICTORY_INDIRECT_RAW=2 as upstream (hung the GPU on our PC); default 3: checked on the CPU first
+  [switch]$RawIndirect,                            # zm0kie: VICTORY_INDIRECT_RAW=2 as upstream (hung the GPU on our PC); default 3: checked on the CPU first
+  [switch]$GpuTime                                 # zm0kie: VICTORY_GPU_TIME=1, GPU ms per command in the log every 5 s ("gpu time top")
 )
 if (-not (Test-Path -LiteralPath $Game)) { "Not found: $Game"; exit 1 }
 # zm0kie: start clean. VICTORY_* variables left in this PowerShell window by other launchers
@@ -156,6 +157,7 @@ if (-not $NoOcean) { $set['VICTORY_OCEAN_READBACK'] = '1' }
 if ($Ram32) { $set['VICTORY_LIST_POOL_MB'] = '512'; $set['VICTORY_LIST_POOL_MOST'] = '1024'; $set['VICTORY_TEXTURE_STAGE_MB'] = '256'; $set['VICTORY_CARD_WINDOWS_MB'] = '3072' }
 foreach ($pair in ($Env -split ';')) { if ($pair -match '^\s*([A-Z0-9_]+)\s*=\s*(.*)$') { $set[$Matches[1]] = $Matches[2] } }
 if ($Dred) { $set['VICTORY_D3D12_DRED'] = '1' }
+if ($GpuTime) { $set['VICTORY_GPU_TIME'] = '1' }
 foreach ($k in $set.Keys) { Set-Item -Path ("Env:" + $k) -Value $set[$k] }
 # The game's folder, for the shader translation (no config file needed).
 $env:VICTORY_GAME_DIR = Split-Path -Parent (Resolve-Path -LiteralPath $Game)

@@ -946,6 +946,7 @@ fn card_copy(list: &crate::host::HostList, to: *mut u8, from: *const u8, len: u6
     target.refresh(list, to, len);
     target.gpu_writes(list, to, len);
     let wait = [crate::indirect::uav_barrier()];
+    list.gpu_stamp("card copy", 0, len);
     // SAFETY: an open list; the list holds both host copies (their
     // refreshes), and the ranges are inside them.
     unsafe {
@@ -1019,6 +1020,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
+            list.gpu_stamp("texture copy resource", 0, 0);
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
         } else if let (Some((to, a)), Some((from, b))) = (
@@ -1193,6 +1195,7 @@ extern "system" fn copy_texture_region(
         }
         const _: () =
             assert!(size_of::<CopyLocation>() == size_of::<D3D12_TEXTURE_COPY_LOCATION>());
+        list.gpu_stamp("texture copy region", 0, 0);
         // SAFETY: an open list; both locations in the host's layout, naming
         // live resources; the box is the title's (same layout).
         unsafe {
@@ -1262,6 +1265,7 @@ fn read_back(
             src.resource, src.footprint.offset as u32, dst.resource, dst.footprint.offset
         )
     });
+    list.gpu_stamp("texture readback", 0, 0);
     // SAFETY: an open list; both locations in the host's layout (asserted
     // in `copy_texture_region`), naming a live texture and our buffer, which
     // the list keeps until it is reset; the box is the title's.
@@ -1322,6 +1326,7 @@ extern "system" fn resolve(
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
+        list.gpu_stamp("resolve", 0, 0);
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());

@@ -2401,6 +2401,7 @@ impl State {
             return;
         }
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+        list.gpu_stamp("dispatch", self.pipeline, u64::from(x) * u64::from(y) * u64::from(z));
         match group_base(p) {
             Some((param, dword)) if x > crate::indirect::PART => {
                 // More than the host runs in one dimension: in parts.
@@ -2699,6 +2700,7 @@ impl State {
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    list.gpu_stamp("mesh", self.pipeline, u64::from(x));
                     self.mesh_scissor(list, true);
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
@@ -3238,6 +3240,7 @@ impl State {
                 (vertices, first)
             };
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            list.gpu_stamp("draw", self.pipeline, u64::from(count) * u64::from(instances));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -3340,6 +3343,7 @@ impl State {
         let ran = !lost && self.prepare(list, true);
         if ran {
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            list.gpu_stamp("draw", self.pipeline, u64::from(indices) * u64::from(instances));
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
@@ -3436,6 +3440,13 @@ impl State {
         const INDEXED: u32 = 1;
         const DISPATCH: u32 = 2;
         const MESH: u32 = 10;
+        let indirect_kind = |kind| match kind {
+            DRAW => "indirect draw",
+            INDEXED => "indirect indexed",
+            DISPATCH => "indirect dispatch",
+            MESH => "indirect mesh",
+            _ => "indirect",
+        };
         #[cfg(feature = "diagnostics")]
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
@@ -3509,6 +3520,7 @@ impl State {
                 return false;
             }
             list.note_op(|| self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), false));
+            list.gpu_stamp(indirect_kind(kind), self.pipeline, u64::from(max));
             // SAFETY: an open list with everything set; the list keeps the host copy
             // alive, and the signature is cached.
             unsafe {
@@ -3564,6 +3576,7 @@ impl State {
                 return false;
             }
             list.note_op(|| self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH));
+            list.gpu_stamp(indirect_kind(kind), self.pipeline, u64::from(max));
             if kind == MESH {
                 self.mesh_scissor(list, true);
             }
@@ -3614,6 +3627,7 @@ impl State {
                     return false;
                 }
                 list.note_op(|| self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), false));
+                list.gpu_stamp(indirect_kind(kind), self.pipeline, u64::from(max));
                 if kind == MESH {
                     self.mesh_scissor(list, true);
                 }
@@ -3733,6 +3747,7 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        list.gpu_stamp(indirect_kind(kind), self.pipeline, u64::from(max));
         if kind == MESH {
             self.mesh_scissor(list, true);
         }

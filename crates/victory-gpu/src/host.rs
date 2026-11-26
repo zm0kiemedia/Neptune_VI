@@ -915,6 +915,8 @@ pub(crate) struct HostList {
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
     stamps: OnceLock<Option<(ID3D12QueryHeap, ID3D12Resource)>>,
+    /// With `VICTORY_GPU_TIME` ([`crate::prof`]): this list's stamps.
+    prof: Mutex<crate::prof::ListProf>,
 }
 
 /// A list's prelude: an allocator and a closed list.
@@ -4205,6 +4207,7 @@ impl Host {
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
+                prof: Mutex::default(),
             })
         }
     }
@@ -4651,6 +4654,7 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let span = crate::prof::span_begin(&list);
                     for ((shadow, ranges), (copies, masked)) in dirty.iter().zip(&sends) {
                         let Some((Some(staging), before, size)) = shadow.card_sides() else {
                             continue;
@@ -4725,6 +4729,7 @@ impl Host {
                         crate::shadow::CARD_STATS[0].fetch_add(parts.iter().map(|&(a, b, _)| (b - a) as u64).sum::<u64>(), Ordering::Relaxed);
                         crate::shadow::CARD_STATS[1].fetch_add(parts.len() as u64, Ordering::Relaxed);
                     }
+                    crate::prof::span_end(&list, span, "card sync");
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     Ok(())
@@ -4805,6 +4810,7 @@ impl Host {
                 (|| -> windows::core::Result<ID3D12CommandList> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let span = crate::prof::span_begin(&list);
                     // What the submission's shaders wrote, first.
                     list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
                         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
@@ -4874,6 +4880,7 @@ impl Host {
                         plan.inflight = every;
                         plan.inflight_landed = inflight.landed;
                     }
+                    crate::prof::span_end(&list, span, "card compare");
                     list.Close()?;
                     list.cast()
                 })()
@@ -5207,9 +5214,11 @@ impl Host {
                 (|| -> windows::core::Result<u64> {
                     allocator.Reset()?;
                     list.Reset(&allocator, None)?;
+                    let span = crate::prof::span_begin(&list);
                     for (shadow, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(&buffer, *at, &shadow.buffer, *lo as u64, (*hi - *lo) as u64);
                     }
+                    crate::prof::span_end(&list, span, "relay card copy");
                     list.Close()?;
                     let lists = [Some(list.cast::<ID3D12CommandList>()?)];
                     // In the order of the queue: the sends of title bytes so
@@ -5630,9 +5639,11 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let span = crate::prof::span_begin(&list);
                     for &(i, lo, hi, at) in &pieces {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
                     }
+                    crate::prof::span_end(&list, span, "card back copy");
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
@@ -6519,9 +6530,96 @@ impl HostList {
         times
     }
 
+    /// With `VICTORY_GPU_TIME`: a GPU stamp before the command about to be
+    /// recorded; the time up to the next stamp is charged to `kind` (a
+    /// command, or the label of our own work), the title pipeline `pipeline`
+    /// (0: our own work) and its count `n`.
+    pub(crate) fn gpu_stamp(&self, kind: &'static str, pipeline: usize, n: u64) {
+        if !crate::prof::on() {
+            return;
+        }
+        let mut p = self.prof.lock().unwrap_or_else(|e| e.into_inner());
+        if !p.decided {
+            p.decided = true;
+            p.frame = crate::frame::current();
+            p.sampled = crate::prof::sampled(p.frame);
+            if p.sampled && p.heap.is_none() {
+                p.heap = host().and_then(|h| crate::prof::make(&h.device));
+            }
+            p.sampled &= p.heap.is_some();
+        }
+        if !p.sampled {
+            return;
+        }
+        if p.keys.len() as u32 >= crate::prof::CAP - 1 {
+            crate::prof::OVER.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let name = if pipeline != 0 { crate::pipeline::hashes_of(pipeline as crate::object::This) } else { String::new() };
+        let at = p.keys.len() as u32;
+        if let Some((heap, _)) = &p.heap {
+            // SAFETY: an open list and our query heap.
+            unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+        }
+        p.keys.push(crate::prof::Key { kind, name, n });
+    }
+
+    /// With `VICTORY_GPU_TIME`, at close: the last stamp and the resolve.
+    fn gpu_resolve(&self) {
+        if !crate::prof::on() {
+            return;
+        }
+        let mut p = self.prof.lock().unwrap_or_else(|e| e.into_inner());
+        let count = p.keys.len() as u32;
+        if !p.sampled || count == 0 {
+            return;
+        }
+        if let Some((heap, back)) = &p.heap {
+            // SAFETY: an open list, our heap and read-back buffer.
+            unsafe {
+                self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, count);
+                self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, 0, count + 1, back, 0);
+            }
+            p.resolved = count + 1;
+        }
+    }
+
+    /// With `VICTORY_GPU_TIME`, at reset (the list has run): reads the stamps.
+    fn gpu_land(&self) {
+        if !crate::prof::on() {
+            return;
+        }
+        let mut p = self.prof.lock().unwrap_or_else(|e| e.into_inner());
+        let (n, frame) = (p.resolved as usize, p.frame);
+        if let (true, Some((_, back))) = (n > 1, &p.heap) {
+            let mut data = std::ptr::null_mut();
+            let range = D3D12_RANGE { Begin: 0, End: n * 8 };
+            // SAFETY: a read-back buffer the finished list resolved into.
+            let stamps: Option<Vec<u64>> = unsafe {
+                back.Map(0, Some(&range), Some(&mut data)).ok().map(|()| {
+                    let s = std::slice::from_raw_parts(data.cast::<u64>(), n).to_vec();
+                    back.Unmap(0, None);
+                    s
+                })
+            };
+            if let Some(stamps) = stamps {
+                // SAFETY: a plain query.
+                let frequency = host().map_or(1, |h| unsafe { h.queue.GetTimestampFrequency() }.unwrap_or(1));
+                crate::prof::land(frame, frequency, &p.keys, &stamps);
+            }
+        }
+        p.decided = false;
+        p.keys.clear();
+        p.resolved = 0;
+    }
+
     pub(crate) fn close(&self) {
+        if crate::prof::on() && !self.prof.lock().unwrap_or_else(|e| e.into_inner()).keys.is_empty() {
+            self.gpu_stamp("list tail: twin and texture copies", 0, 0);
+        }
         self.twins_to_depth();
         self.textures_back();
+        self.gpu_resolve();
         #[cfg(feature = "diagnostics")]
         if let Some((heap, back)) = self.stamps() {
             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
@@ -6545,6 +6643,7 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        self.gpu_land();
         self.changes.fetch_add(1, Ordering::Relaxed);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -8802,6 +8901,7 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
+            copy.gpu_stamp("present copy", 0, 0);
             list.CopyResource(&back, texture);
             let shot = shot_now.then(|| crate::screenshot::read_back(&self.device, list, texture)).flatten();
             #[cfg(feature = "diagnostics")]
@@ -8814,6 +8914,7 @@ impl Host {
             let _ = frame;
             // A second plane over the first (the title's UI over its game plane).
             let composed = over.is_some_and(|(plane, before)| {
+                copy.gpu_stamp("present ui compose", 0, 0);
                 self.record_overlay(list, &back, p.format, (p.width, p.height), plane, D3D12_RESOURCE_STATES(before as i32))
             });
             list.ResourceBarrier(&[

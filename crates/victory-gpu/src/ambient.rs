@@ -558,6 +558,7 @@ fn record(list: &HostList, light: This, depth: Option<This>, held: f32) -> bool 
         list.keep(depth);
     }
     let l = &list.list;
+    list.gpu_stamp("ambient", 0, 0);
     uav_barrier(l);
     // SAFETY: an open list; a live texture the list keeps, in the
     // unordered-access state as the program before left it; a view in a slot

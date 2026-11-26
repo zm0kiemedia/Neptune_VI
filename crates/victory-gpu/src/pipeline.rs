@@ -626,6 +626,13 @@ pub(crate) fn shaders_of(this: This) -> String {
     format!("[{}]", names.join(", "))
 }
 
+/// The stages and hashes of title pipeline `this` for the GPU time lines.
+#[cfg(windows)]
+pub(crate) fn hashes_of(this: This) -> String {
+    let names: Vec<String> = pipeline(this).shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect();
+    names.join(" ")
+}
+
 /// List method: logs each pipeline's shaders the first time a list binds
 /// it, so a run lists the shaders its frames need first.
 pub(crate) fn bound(this: This) {
