@@ -8397,6 +8397,12 @@ impl Meter {
             tracing::info!(
                 "indirect records per frame: {ahead:.0} clamped ahead in their lists' preludes, {in_place:.0} clamped in place (VICTORY_CLAMP_AHEAD=0: all in place), {raw:.0} drawn as the title wrote them (VICTORY_INDIRECT_RAW=2)"
             );
+            let [dispatches, covered] = [3, 4].map(|i| crate::draw::CLAMPS[i].swap(0, Ordering::Relaxed) as f64);
+            tracing::info!(
+                "in-place clamp dispatches per frame: {:.0}, {:.1} records each (VICTORY_CLAMP_BATCH=1 batches them in windows; off: one record per dispatch)",
+                dispatches / frames,
+                if dispatches > 0.0 { covered / dispatches } else { 0.0 }
+            );
             let [ok, written, bad, unread] = [0, 1, 2, 3].map(|i| crate::draw::RAW3[i].swap(0, Ordering::Relaxed) as f64 / frames);
             if ok + written + bad + unread > 0.0 {
                 tracing::info!(
@@ -8635,10 +8641,10 @@ impl Meter {
                 );
             }
             {
-                let [kept, nulled, again] = [0, 1, 2].map(|i| crate::descriptor::host::STALE_KEPT[i].load(Ordering::Relaxed));
+                let [kept, nulled, again] = [0, 1, 2].map(|i| crate::descriptor::host::STALE_KEPT[i].swap(0, Ordering::Relaxed));
                 tracing::info!(
-                    "slots whose view a newer view made stale, so far: {kept} went on showing their texture (VICTORY_STALE_KEEP_MS=0: \
-                     null at once), {again} of them were made again in that time, {nulled} were made null when it was up"
+                    "slots whose view a newer view made stale, in the last period: {kept} went on showing their texture (VICTORY_STALE_KEEP_MS=0: \
+                     null at once), {again} were replaced by their new view, {nulled} hit the cap (VICTORY_STALE_KEEP_MAX_MS) and were made null"
                 );
             }
             crate::tiles::status();

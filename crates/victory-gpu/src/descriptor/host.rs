@@ -471,7 +471,7 @@ pub(crate) static FRESH_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub(crate) static QUEUE_AGE: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// (Neptune) Since the start: slots that went on showing their texture when their view was
-/// made stale ([`HostHeap::stale_kept`]), those made null when their time was up, and those
+/// made stale ([`HostHeap::stale_kept`]), those made null at the cap (`VICTORY_STALE_KEEP_MAX_MS`), and those
 /// made again before.
 pub(crate) static STALE_KEPT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
@@ -481,6 +481,19 @@ pub(crate) static STALE_KEPT: [std::sync::atomic::AtomicU64; 3] = [const { std::
 fn stale_keep_ms() -> u64 {
     static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *MS.get_or_init(|| std::env::var("VICTORY_STALE_KEEP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10_000))
+}
+
+/// How long a kept slot may wait for its replacement view before it is made null
+/// (`VICTORY_STALE_KEEP_MAX_MS`, 120,000; bounds the VRAM the old textures hold).
+/// `VICTORY_STALE_EXPIRE_NULL=1`: null after [`stale_keep_ms`], as before.
+fn stale_expire_ms() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        if std::env::var_os("VICTORY_STALE_EXPIRE_NULL").is_some_and(|v| v == "1") {
+            return stale_keep_ms();
+        }
+        std::env::var("VICTORY_STALE_KEEP_MAX_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(120_000)
+    })
 }
 
 /// Whether a view written over memory that older views describe otherwise
@@ -1879,7 +1892,7 @@ impl HostHeap {
     pub(crate) fn stale_expire(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         let now = (crate::host::now_ms() / 100) as u32 + 1;
-        let keep = (stale_keep_ms() / 100) as u32;
+        let keep = (stale_expire_ms() / 100) as u32;
         let due: Vec<(u32, u32, u64)> = {
             let mut line = self.stale_line.lock().unwrap_or_else(|e| e.into_inner());
             let n = line.iter().take_while(|&&(_, tick, _)| now.saturating_sub(tick) >= keep).count();
@@ -1911,6 +1924,10 @@ impl HostHeap {
     }
 
     fn unmake(&self, made: &mut [u64], index: u32) {
+        // Freed or reused: no longer one waiting for its replacement view.
+        if let Some(at) = self.stale_at.get(index as usize) {
+            at.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };

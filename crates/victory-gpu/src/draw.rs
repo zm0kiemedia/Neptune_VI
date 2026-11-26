@@ -247,7 +247,8 @@ fn clamp_ahead() -> bool {
 
 /// (Neptune) Since the last frame line: indirect records clamped ahead in
 /// their lists' preludes, and clamped in place.
-pub(crate) static CLAMPS: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+/// [3]: clamp dispatches recorded in place (`VICTORY_CLAMP_BATCH`), [4]: the records they cover.
+pub(crate) static CLAMPS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// (Neptune) Since they were last taken: tables made afresh that a draw found ready, found
 /// made but made ready again, and made (and the slots made for them).
@@ -307,6 +308,18 @@ fn raw_indirect() -> bool {
 fn windows() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1"))
+}
+
+/// (Neptune) `VICTORY_CLAMP_BATCH=1` (off by default): the records that cannot be clamped
+/// ahead (an earlier shader of their list may write their arguments, so the clamp must run
+/// after that writer, in place) are clamped a window at a time with the `windows` machinery,
+/// one dispatch and one barrier pair for up to `WINDOW_MOST` records, instead of one each.
+/// Windows end at every writer the list records (dispatches, draws, indirect calls of other
+/// shapes, draws whose shaders store); the clamp is the same `bound_ahead` one, so a garbage
+/// record is still clamped (or left empty) before any draw reads it.
+fn batch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CLAMP_BATCH").is_some_and(|v| v == "1"))
 }
 
 /// What one title list has set, and what its host list was last given.
@@ -3731,7 +3744,7 @@ impl State {
         } else {
             None
         };
-        let windowed = windows()
+        let windowed = (windows() || batch())
             && kind != DISPATCH
             && max == 1
             && count.is_none()
@@ -3789,6 +3802,10 @@ impl State {
                 } else {
                     crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
                 };
+                if bounded.is_some() {
+                    CLAMPS[3].fetch_add(1, Ordering::Relaxed);
+                    CLAMPS[4].fetch_add(u64::from(records), Ordering::Relaxed);
+                }
                 let Some(bounded) = bounded else {
                     self.window = None;
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
