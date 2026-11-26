@@ -53,6 +53,27 @@ enum Held {
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
     Signal(usize, u64),
+    /// (Neptune, after avatarmanz/VIctory-7900XTX 3a99ee61) A submission whose lists are
+    /// being translated (`crate::list::thin`): its parts take its place when they are.
+    Lists(Recordings),
+}
+
+/// The recordings of a submission's lists, in its order.
+#[cfg(windows)]
+type Recordings = std::sync::Arc<[std::sync::Arc<crate::list::thin::Recording>]>;
+
+/// (Neptune) Whether submissions go into their queues' lines for a thread of ours
+/// ([`async_submit`]): what `crate::list::thin` needs.
+#[cfg(windows)]
+pub(crate) fn line_on() -> bool {
+    async_submit()
+}
+
+/// (Neptune) Lists in a line may have been translated (`crate::list::thin`): the thread that
+/// runs the lines looks again.
+#[cfg(windows)]
+pub(crate) fn line_moved() {
+    wake_releaser();
 }
 
 /// The queues that hold something (their addresses).
@@ -73,7 +94,8 @@ static WAITING: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new())
 #[cfg(windows)]
 fn async_submit() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1"))
+    // (With lists written down, `VICTORY_THIN=1`, there is no other way.)
+    *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1") || crate::list::thin::wanted())
 }
 
 /// (Neptune) Whether a present waits its turn behind the submissions too
@@ -270,6 +292,21 @@ fn submit_cut(this: This, lists: &[This]) {
     let Some(host) = crate::host::host() else {
         return;
     };
+    if crate::list::thin::on() {
+        let recordings = crate::list::thin::submitted(lists);
+        if recordings.is_empty() {
+            return;
+        }
+        if let Some(pieces) = later(this as usize, vec![Held::Lists(recordings)]) {
+            lock(&queue(this).held).extend(pieces);
+            let mut waiting = lock(&WAITING);
+            if !waiting.contains(&(this as usize)) {
+                waiting.push(this as usize);
+            }
+        }
+        wake_releaser();
+        return;
+    }
     let first = if !async_submit() && lock(&queue(this).held).is_empty() {
         lists
             .iter()
@@ -298,6 +335,7 @@ fn submit_cut(this: This, lists: &[This]) {
         // from the title's lists (which it may reset before they have run)
         // and come back, with their tables' slots, when they are settled.
         let (taken, order) = crate::list::detach(&lists[..first]);
+        ahead_of_frame(host);
         host.execute_late(taken, order);
     } else if first > 0 {
         let now: Vec<_> = lists[..first]
@@ -510,10 +548,36 @@ pub(crate) fn release_held(all: bool) {
                         break;
                     }
                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                    Some(Held::Lists(recordings)) if !recordings.iter().all(|r| r.done()) => {
+                        if !all {
+                            // Its turn comes when they are translated ([`line_moved`]).
+                            break;
+                        }
+                        // A present: the frame's lists are waited for, without the line's
+                        // lock (the title's calls for this queue go behind them).
+                        let recordings = recordings.clone();
+                        drop(held);
+                        recordings.iter().for_each(|r| r.wait());
+                        held = lock(held_of);
+                        continue;
+                    }
                     Some(_) => {}
                 }
                 match held.remove(0) {
                     Held::Wait(..) => {}
+                    Held::Lists(recordings) => {
+                        // Translated: the parts of the lists of ours they went to, in its
+                        // place in the line, as `submit_cut` gives a submission's.
+                        let backs: Vec<This> = recordings.iter().map(|r| r.back()).collect();
+                        let mut pieces: Vec<Held> = Vec::new();
+                        for (waits, taken, order) in crate::list::detach_parts(&backs) {
+                            pieces.extend(waits.into_iter().map(Held::Value));
+                            pieces.push(Held::Run(taken, order));
+                        }
+                        held.splice(0..0, pieces);
+                        moved = true;
+                        continue;
+                    }
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
                         // queue stood at.
@@ -561,10 +625,12 @@ pub(crate) fn release_held(all: bool) {
                                 // (`RUNNING`), they do not wait for it.
                                 RUNNING.store(q, Ordering::Release);
                                 drop(held);
+                                ahead_of_frame(host);
                                 host.execute_late(lists, order);
                                 held = lock(held_of);
                                 RUNNING.store(0, Ordering::Release);
                             } else {
+                                ahead_of_frame(host);
                                 host.execute_late(lists, order);
                             }
                         } else {
@@ -613,6 +679,132 @@ pub(crate) fn release_held(all: bool) {
             break;
         }
     }
+}
+
+/// (Neptune) Ahead of the first submission since the last present: the list of the frame's
+/// passes over the heap's views (`crate::list::ahead_of_frame`), sent as a submission of its
+/// own. Called where submissions are sent in their order, by one thread at a time.
+#[cfg(windows)]
+fn ahead_of_frame(host: &crate::host::Host) {
+    static SEEN: AtomicU64 = AtomicU64::new(u64::MAX);
+    let frame = FRAMES.load(Ordering::Relaxed);
+    if SEEN.swap(frame, Ordering::Relaxed) == frame {
+        return;
+    }
+    let began = std::time::Instant::now();
+    let ahead = {
+        let mut ahead = lock(&AHEAD.0);
+        if ahead.state == 0 {
+            // Not begun (the first frame): recorded here.
+            drop(ahead);
+            crate::list::ahead_of_frame()
+        } else {
+            while ahead.state == 1 {
+                ahead = AHEAD.1.wait(ahead).unwrap_or_else(|e| e.into_inner());
+            }
+            let list = ahead.list.take();
+            // The next one, if the title has asked for it already.
+            ahead.state = u8::from(std::mem::take(&mut ahead.again));
+            if ahead.state == 1 {
+                AHEAD.1.notify_all();
+            }
+            list
+        }
+    };
+    AHEAD_WAITED.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+    if let Some(ahead) = ahead {
+        host.execute_late(vec![ahead], vec![0]);
+    }
+}
+
+/// (Neptune) The list ahead of the next frame ([`ahead_of_frame`]): 0 not begun, 1 being
+/// recorded by its thread, 2 recorded; and the list.
+#[cfg(windows)]
+struct Ahead {
+    state: u8,
+    list: Option<crate::list::Detached>,
+    /// Asked for again while the one recorded had not been taken (the title was a frame
+    /// ahead): begun when that one is taken.
+    again: bool,
+}
+
+// SAFETY: a host list and what it holds, handed from the thread that records it to the one
+// that sends it, as the queues' lines hand theirs.
+#[cfg(windows)]
+unsafe impl Send for Ahead {}
+
+#[cfg(windows)]
+static AHEAD: (std::sync::Mutex<Ahead>, std::sync::Condvar) =
+    (std::sync::Mutex::new(Ahead { state: 0, list: None, again: false }), std::sync::Condvar::new());
+
+/// (Neptune) Microseconds the thread that runs the lines waited for the list ahead of a
+/// frame, since the last frame line.
+#[cfg(windows)]
+pub(crate) static AHEAD_WAITED: AtomicU64 = AtomicU64::new(0);
+
+/// (Neptune) A frame has been presented: the list ahead of the next one is recorded from now
+/// on, by a thread of its own, beside the present and whatever comes before the next
+/// frame's first submission (12.4 ms a frame of the thread that runs the lines otherwise,
+/// run ve170). Everything of the frame presented has been sent by now.
+#[cfg(windows)]
+fn ahead_begin() {
+    if !crate::draw::passes_ahead() {
+        return;
+    }
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let made = std::thread::Builder::new().name("victory-ahead".into()).stack_size(8 << 20).spawn(|| {
+            crate::cores::keep_on_fast_cores("victory-ahead");
+            loop {
+                {
+                    let mut ahead = lock(&AHEAD.0);
+                    while ahead.state != 1 {
+                        ahead = AHEAD.1.wait(ahead).unwrap_or_else(|e| e.into_inner());
+                    }
+                }
+                let list = crate::list::ahead_of_frame();
+                let mut ahead = lock(&AHEAD.0);
+                ahead.list = list;
+                ahead.state = 2;
+                drop(ahead);
+                AHEAD.1.notify_all();
+            }
+        });
+        if let Err(e) = made {
+            tracing::warn!(error = %e, "no thread for the list ahead of a frame: it is recorded where it is sent");
+            AHEAD_NONE.store(true, Ordering::Relaxed);
+        }
+    });
+    if AHEAD_NONE.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut ahead = lock(&AHEAD.0);
+    match ahead.state {
+        0 => {
+            ahead.state = 1;
+            drop(ahead);
+            AHEAD.1.notify_all();
+        }
+        // The one before is not taken yet (or not recorded): this one after it.
+        _ => ahead.again = true,
+    }
+}
+
+#[cfg(windows)]
+static AHEAD_NONE: AtomicBool = AtomicBool::new(false);
+
+/// (Neptune) Whether the list ahead of a frame is begun at the title's present call
+/// (`VICTORY_AHEAD_EARLY=1`; off: when the present has run).
+///
+/// Begun early the thread that runs the lines no longer waits for it (10 ms a frame, run
+/// ve172), but the frame was no shorter (81.7 ms against 80.7) and the list no longer saw
+/// what the title wrote into its heap while that thread caught up: of the textures picked
+/// by index 61 % were there in the frame their slot was written, 32 % one frame later, and
+/// what streamed in flickered again (run ve173, the user). So it is off.
+#[cfg(windows)]
+fn ahead_early() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_AHEAD_EARLY").is_some_and(|v| v == "1"))
 }
 
 /// Whether a queue may pass `wait`: memory holds the value, or, with
@@ -1006,6 +1198,11 @@ extern "system" fn present(
             later.pending = true;
             later.job = Some(Box::new(move || present_now(named)));
         }
+        // (Neptune) With `VICTORY_AHEAD_EARLY=1`: the title has recorded its frame, and the
+        // list ahead of the next one is recorded from now on ([`ahead_early`]).
+        if ahead_early() {
+            ahead_begin();
+        }
         wake_releaser();
         return S_OK;
     }
@@ -1037,6 +1234,12 @@ fn present_now(named: Named) {
     #[cfg(windows)]
     release_held(forces());
     let frame = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // (Where the present waits its turn the list ahead of the next frame was begun at the
+    // title's call, `present`.)
+    #[cfg(windows)]
+    if !async_present() || !ahead_early() {
+        ahead_begin();
+    }
     if frame.is_power_of_two() {
         let (draws, dispatches) = crate::list::take_counts();
         #[cfg(windows)]

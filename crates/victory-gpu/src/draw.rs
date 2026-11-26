@@ -103,6 +103,36 @@ fn early_budgets() -> (u64, u64) {
     })
 }
 
+/// (Neptune) Whether the once-a-frame passes over the heap's views (the buffers and the
+/// textures shaders pick by an index they compute) are recorded into a list of ours that
+/// runs ahead of the frame's first submission (`VICTORY_PASSES_AHEAD`: 1 or 0; unset: with
+/// `VICTORY_THIN=1`).
+///
+/// They were recorded into the list whose draw asked first, in the order the title records:
+/// its first list of a frame, which it also submits first. With lists translated by threads
+/// of ours that list is any of the frame's, often one submitted late: lists submitted before
+/// it read last frame's buffers through the heap (run ve167: hair and whole people drawn
+/// from old bones, 44 dark patches in 25 s; one translating thread: 2).
+pub(crate) fn passes_ahead() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| match std::env::var("VICTORY_PASSES_AHEAD") {
+        Ok(v) => v.trim() != "0",
+        Err(_) => crate::list::thin::wanted(),
+    })
+}
+
+/// (Neptune) The title's view heap a draw last had set ([`passes_ahead`]; 0: none yet).
+static VIEW_HEAP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+thread_local! {
+    /// (Neptune) This thread records the list that runs ahead of a frame ([`State::passes_ahead`]).
+    static AHEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// (Neptune) Lists recorded ahead of a frame, and the microseconds that took, since the last
+/// frame line.
+pub(crate) static AHEAD_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
 /// (Neptune) The least milliseconds between two passes over textures picked by index within
 /// a frame, when the title has written slots since the last one (`VICTORY_TEXTURE_CATCH_UP_MS`,
 /// 2; 0: one pass a frame, as before), and the fewest slots written for one. Such a pass
@@ -1585,13 +1615,38 @@ impl State {
     /// writes through a picked unordered access view stays in the host
     /// copy. A list refreshes them where it first runs such a shader;
     /// title writes recorded later in the same list are not seen.
+    /// (Neptune) Records into `list`, a list of ours that runs ahead of a frame's first
+    /// submission, what the frame's lists find done ([`passes_ahead`]): the heap's buffer
+    /// views brought up to date and the textures picked by index uploaded. `false`: no
+    /// draw has had a view heap set yet.
+    pub(crate) fn passes_ahead(&mut self, list: &HostList) -> bool {
+        let at = VIEW_HEAP.load(Ordering::Relaxed);
+        if at == 0 {
+            return false;
+        }
+        let began = std::time::Instant::now();
+        self.heaps = [at, 0];
+        AHEAD.set(true);
+        if self.heap_buffers(list).is_none() {
+            // No shader has picked a buffer from the heap yet: the textures' pass alone.
+            let heap = crate::descriptor::heap(at as This);
+            if let Some(host) = heap.host() {
+                self.heap_textures(list, heap, host);
+            }
+        }
+        AHEAD.set(false);
+        AHEAD_STATS[0].fetch_add(1, Ordering::Relaxed);
+        AHEAD_STATS[1].fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
+        true
+    }
+
     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
-        let heap = self
+        let at = *self
             .heaps
             .iter()
             .filter(|&&h| h != 0)
-            .map(|&h| crate::descriptor::heap(h as This))
-            .find(|h| !h.samplers())?;
+            .find(|&&h| !crate::descriptor::heap(h as This).samplers())?;
+        let heap = crate::descriptor::heap(at as This);
         let host = heap.host()?;
         let gpu = host.strides_gpu()?;
         // One key per list, as textures have: no title resource is there.
@@ -1603,6 +1658,14 @@ impl State {
         if let Some(buffer) = host.strides_buffer() {
             list.keep(buffer);
         }
+        // (Neptune) The pass is the list's that runs ahead of the frame ([`passes_ahead`]).
+        let ahead = AHEAD.get();
+        if !ahead && passes_ahead() {
+            if VIEW_HEAP.load(Ordering::Relaxed) != at {
+                VIEW_HEAP.store(at, Ordering::Relaxed);
+            }
+            return Some(gpu);
+        }
         // The pass itself once per frame: per list it ran up to 51 times a
         // frame over 81,000 views and 4,100 host copies, 18 s of every
         // frame (2026-11-24, run 11).
@@ -1610,7 +1673,8 @@ impl State {
         // of one frame is seen a frame late.
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         let frame = crate::frame::current();
-        if FRAME.swap(frame, Ordering::Relaxed) == frame {
+        // (The list ahead of a frame is made once a frame by its maker.)
+        if FRAME.swap(frame, Ordering::Relaxed) == frame && !ahead {
             return Some(gpu);
         }
         let started = std::time::Instant::now();
@@ -1770,9 +1834,20 @@ impl State {
         static CATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let now = crate::host::now_ms();
         let mut catching = false;
+        // (Neptune) The frame's pass and those that catch up are the list's that runs ahead
+        // of the frame ([`passes_ahead`]): here the heap is noted for it.
+        let ahead = passes_ahead();
+        if ahead
+            && let Some(&at) = self.heaps.iter().filter(|&&h| h != 0).find(|&&h| !crate::descriptor::heap(h as This).samplers())
+            && VIEW_HEAP.load(Ordering::Relaxed) != at
+        {
+            VIEW_HEAP.store(at, Ordering::Relaxed);
+        }
         let budget = if bake && left > 0 {
             // What a bake may read must be there now: up to 2 GiB.
             (left, 2 << 30)
+        } else if ahead {
+            return;
         } else if first && early_ms > 0 {
             (early_ms, 64 << 20)
         } else if catch_up_ms() != 0

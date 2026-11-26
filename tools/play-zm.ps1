@@ -36,6 +36,7 @@ param(
   [switch]$Ram32,                                  # zm0kie: 32 GB PC profile (smaller pools)
   [string]$Env = '',                               # zm0kie: extra variables 'NAME=value;NAME2=value'
   [switch]$Dred,                                   # zm0kie: device-removed report (DRED breadcrumbs, page fault, per-command pipeline hashes)
+  [switch]$NoThin,                                 # upstream: draw calls translated on the game's own threads, as before
   [switch]$NoOcean,                                # zm0kie: no ocean read-back (boats sink, no swimming)
   [switch]$RawIndirect,                            # zm0kie: VICTORY_INDIRECT_RAW=2 as upstream (hung the GPU on our PC); default 3: checked on the CPU first
   [switch]$GpuTime                                 # zm0kie: VICTORY_GPU_TIME=1, GPU ms per command in the log every 5 s ("gpu time top")
@@ -73,6 +74,7 @@ $set = [ordered]@{
   VICTORY_LIST_POOL_MB        = '2048'
   VICTORY_WIDE_THREADS        = '12'
   VICTORY_UNDER_WRITES_MASKS_LEAST = '1'   # small changes go up in one pass per buffer
+  VICTORY_THIN                = $(if ($NoThin) { '0' } else { '1' })  # (upstream ab7c9cf) the game's draw calls translated by more threads of ours
   VICTORY_WATCH_4K            = '1'         # (upstream evening build) 4 KiB write tracking
   VICTORY_INDIRECT_RAW        = $(if ($RawIndirect) { '2' } else { '3' })  # indirect draws use the game's own arguments
   VICTORY_TEXTURE_HASH_EVERY  = '32'

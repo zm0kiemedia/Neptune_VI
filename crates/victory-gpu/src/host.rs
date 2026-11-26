@@ -8473,6 +8473,17 @@ impl Meter {
                  {pipelines:.0} pipelines bound again and not kept again"
             );
         }
+        crate::list::thin::line(frames);
+        if crate::draw::passes_ahead() {
+            let [lists, micros] = [0, 1].map(|i| crate::draw::AHEAD_STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(
+                "lists of ours ahead of a frame's first submission, for its passes over the heap's views \
+                 (VICTORY_PASSES_AHEAD=0: in the list that asks first): {lists:.2} a frame, {:.1} ms a frame on a \
+                 thread of their own; the thread that runs the lines waited {:.1} ms a frame for them",
+                micros / 1000.0,
+                crate::queue::AHEAD_WAITED.swap(0, Ordering::Relaxed) as f64 / frames / 1000.0
+            );
+        }
         {
             let [copied, made, ready] = [0, 1, 2].map(|i| crate::descriptor::host::LISTED[i].swap(0, Ordering::Relaxed) as f64 / frames);
             tracing::info!(

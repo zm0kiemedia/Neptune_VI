@@ -18,6 +18,9 @@ use crate::object::{
 use crate::queue::Written;
 use crate::resource::PAGEABLE_IIDS;
 
+#[cfg(windows)]
+pub(crate) mod thin;
+
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
         0x6102dee4,
@@ -127,6 +130,10 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// (Neptune, from avatarmanz/VIctory-7900XTX) With `VICTORY_THIN=1`, of a list the title
+    /// has: what it wrote down ([`thin`]; then there is no `host`).
+    #[cfg(windows)]
+    thin: thin::Front,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -178,7 +185,10 @@ pub(crate) fn is_list(this: This) -> bool {
     }
     // SAFETY: a title object's first word is its table; only read.
     let table = unsafe { (*this).table() };
-    table == LIST_FUNCTIONS.0.as_ptr() || table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+    table == LIST_FUNCTIONS.0.as_ptr()
+        || table == NEWER_LIST_FUNCTIONS.0.as_ptr()
+        || table == THIN_FUNCTIONS.0.as_ptr()
+        || table == NEWER_THIN_FUNCTIONS.0.as_ptr()
 }
 
 /// Runs `f` with the host list behind `this` and the draw state the title
@@ -188,7 +198,20 @@ pub(crate) fn with_host(
     this: This,
     f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State),
 ) -> bool {
-    if !is_list(this) || host_list(this).is_none() {
+    if !is_list(this) {
+        return false;
+    }
+    // (Neptune) A list whose calls are written down has its host list behind a list of ours,
+    // once what was written so far is translated.
+    let this = if thin::on() && host_list(this).is_none() {
+        match thin::caught_up(this) {
+            Some(back) => back,
+            None => return false,
+        }
+    } else {
+        this
+    };
+    if host_list(this).is_none() {
         return false;
     }
     with_state(this, f);
@@ -518,6 +541,26 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
     parts
 }
 
+/// (Neptune) A list of ours for a frame's first submission to run behind: the once-a-frame
+/// passes over the heap's views, recorded now (`crate::draw::passes_ahead`). `None`: not
+/// asked for, no draw has had a view heap yet, or no host list.
+#[cfg(windows)]
+pub(crate) fn ahead_of_frame() -> Option<Detached> {
+    if !crate::draw::passes_ahead() {
+        return None;
+    }
+    let host = fresh_list()?;
+    let mut state = crate::draw::State::default();
+    let recorded = state.passes_ahead(&host);
+    host.close();
+    if !recorded {
+        // Used again as it is.
+        recycle(vec![Detached { host, _uploads: Vec::new(), _state: state }], &[0]);
+        return None;
+    }
+    Some(Detached { host, _uploads: Vec::new(), _state: state })
+}
+
 /// Takes the host sides of submitted lists (each once, however often the
 /// submission names it) and leaves each list a new, closed host list for
 /// its next reset: what was taken, and which of them run in what order.
@@ -631,11 +674,29 @@ fn new_list(
         return E_INVALIDARG;
     }
     tracing::debug!(kind, "command list");
+    #[cfg(windows)]
+    if thin::on() {
+        let mut list = boxed(kind, pipeline, true);
+        list.thin.begin(kind, pipeline);
+        return object::hand_out(LIST, list, iid, &LIST_IIDS, out);
+    }
+    object::hand_out(LIST, boxed(kind, pipeline, false), iid, &LIST_IIDS, out)
+}
+
+/// A list; with `thin` one whose calls are written down (it has no host list).
+fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
+    #[cfg(not(windows))]
+    let _ = thin;
     let list = Box::new(List {
-        object: if crate::device::newer() {
-            Object::new(&NEWER_LIST_FUNCTIONS)
-        } else {
-            Object::new(&LIST_FUNCTIONS)
+        object: match (crate::device::newer(), thin) {
+            (true, false) => Object::new(&NEWER_LIST_FUNCTIONS),
+            (false, false) => Object::new(&LIST_FUNCTIONS),
+            #[cfg(windows)]
+            (true, true) => Object::new(&NEWER_THIN_FUNCTIONS),
+            #[cfg(windows)]
+            (false, true) => Object::new(&THIN_FUNCTIONS),
+            #[cfg(not(windows))]
+            _ => Object::new(&LIST_FUNCTIONS),
         },
         kind,
         put: [0; 5],
@@ -646,7 +707,7 @@ fn new_list(
         newer: [0; 256],
         uploads: Default::default(),
         #[cfg(windows)]
-        host: crate::host::host().and_then(|h| match h.new_list() {
+        host: crate::host::host().filter(|_| !thin).and_then(|h| match h.new_list() {
             Ok(list) => Some(list),
             Err(e) => {
                 tracing::warn!(error = %e, "no host command list");
@@ -663,10 +724,12 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        #[cfg(windows)]
+        thin: Default::default(),
     });
     #[cfg(not(windows))]
     let _ = pipeline;
-    object::hand_out(LIST, list, iid, &LIST_IIDS, out)
+    list
 }
 
 extern "system" fn allocator_query(this: This, iid: *const Iid, out: *mut This) -> HRESULT {
@@ -2337,6 +2400,11 @@ const fn list_table(newer: bool) -> [*const (); 160] {
 /// titles add.
 static LIST_FUNCTIONS: Table<160> = Table(list_table(false));
 static NEWER_LIST_FUNCTIONS: Table<160> = Table(list_table(true));
+/// (Neptune, from avatarmanz/VIctory-7900XTX) Of lists whose calls are written down.
+#[cfg(windows)]
+static THIN_FUNCTIONS: Table<160> = Table(thin::table(false));
+#[cfg(windows)]
+static NEWER_THIN_FUNCTIONS: Table<160> = Table(thin::table(true));
 
 #[cfg(test)]
 mod tests {
